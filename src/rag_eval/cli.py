@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import typer
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 from rag_eval.cache.sqlite_cache import SqliteCache
 from rag_eval.config import (
@@ -14,6 +17,14 @@ from rag_eval.config import (
     build_env,
     load_providers_config,
     resolve_api_key,
+)
+from rag_eval.ingest.downloader import download_corpus
+from rag_eval.ingest.manifest import (
+    DEFAULT_CORPUS_CONFIG_PATH,
+    DEFAULT_RAW_DIR,
+    ManifestEntry,
+    ManifestError,
+    scan_local_pdfs,
 )
 from rag_eval.providers.embeddings import EmbeddingClient, EmbeddingError
 from rag_eval.providers.llm import AllProvidersFailed, LLMRouter
@@ -31,6 +42,14 @@ _VALID_TARGETS = ("embedding", "llm", "rerank")
 @app.callback()
 def _root() -> None:
     """Keep Typer from collapsing the CLI into a single command."""
+
+
+corpus_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Corpus manifest: register local PDFs and fetch the rest.",
+)
+app.add_typer(corpus_app, name="corpus")
 
 
 @app.command()
@@ -256,6 +275,109 @@ def cache_stats(
         if rows:
             typer.echo("")
             typer.echo(_table(("provider", "window_date", "used"), rows))
+
+
+@corpus_app.command("scan-local")
+def corpus_scan_local(
+    raw_dir: Path = typer.Option(
+        DEFAULT_RAW_DIR, "--raw-dir", help="Directory holding manually downloaded PDFs."
+    ),
+    config: Path = typer.Option(
+        DEFAULT_CORPUS_CONFIG_PATH, "--config", "-c", help="Path to corpus.yaml."
+    ),
+) -> None:
+    """Register PDFs already present in the raw directory."""
+    try:
+        result = scan_local_pdfs(raw_dir, config)
+    except ManifestError as exc:
+        typer.secho(f"FAIL  {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+    if not result.added and not result.skipped:
+        typer.echo(f"no PDFs found in {raw_dir}")
+        typer.echo(f"config  {result.config_path}")
+        return
+
+    table = Table(title=f"scan-local  {raw_dir}", header_style="bold")
+    table.add_column("file / doc_id", no_wrap=True)
+    table.add_column("result", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+    for doc_id in result.added:
+        table.add_row(doc_id, Text("added", style="green"), "")
+    for name, reason in result.skipped:
+        table.add_row(name, Text("skipped", style="yellow"), reason)
+    Console().print(table)
+    typer.echo("")
+    typer.echo(f"config  {result.config_path}")
+    typer.secho(
+        f"OK    {len(result.added)} added, {len(result.skipped)} skipped",
+        fg=typer.colors.GREEN,
+    )
+
+
+@corpus_app.command("download")
+def corpus_download(
+    config: Path = typer.Option(
+        DEFAULT_CORPUS_CONFIG_PATH, "--config", "-c", help="Path to corpus.yaml."
+    ),
+    raw_dir: Path = typer.Option(DEFAULT_RAW_DIR, "--raw-dir", help="PDF output directory."),
+    allow_partial: bool = typer.Option(
+        False, "--allow-partial", help="Exit 0 even when some documents fail."
+    ),
+) -> None:
+    """Verify local PDFs and download anything missing."""
+    try:
+        summary = download_corpus(config, raw_dir)
+    except ManifestError as exc:
+        typer.secho(f"FAIL  {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+    _print_manifest(summary.entries)
+    typer.echo("")
+    typer.echo(f"manifest  {summary.manifest_path}")
+    typer.echo(
+        f"total {len(summary.entries)}  ok {summary.ok_count}  failed {summary.failed_count}"
+    )
+
+    if not summary.entries:
+        typer.secho(
+            "WARN  no documents configured in the corpus manifest",
+            fg=typer.colors.YELLOW,
+        )
+
+    if summary.has_failures:
+        if allow_partial:
+            typer.secho(
+                "WARN  some documents failed (--allow-partial)", fg=typer.colors.YELLOW
+            )
+            return
+        typer.secho(
+            "FAIL  some documents failed; see the table above",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.secho("OK    corpus is ready", fg=typer.colors.GREEN)
+
+
+def _print_manifest(entries: list[ManifestEntry]) -> None:
+    table = Table(title="corpus download", header_style="bold")
+    table.add_column("doc_id", no_wrap=True)
+    table.add_column("status", no_wrap=True)
+    table.add_column("bytes", justify="right", no_wrap=True)
+    table.add_column("sha256", no_wrap=True)
+    table.add_column("note", overflow="fold")
+    for entry in entries:
+        style = "red" if entry.status == "failed" else "green"
+        table.add_row(
+            entry.doc_id,
+            Text(entry.status, style=style),
+            "-" if entry.bytes is None else f"{entry.bytes:,}",
+            entry.sha256[:12] if entry.sha256 else "-",
+            entry.error or "",
+        )
+    Console().print(table)
 
 
 def _table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:

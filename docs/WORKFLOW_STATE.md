@@ -126,8 +126,100 @@ and reports `nvidia_super` / `nvidia_ultra` as `ready`.
 - No live provider smoke test has been run, because no API keys are available in
   this environment.
 
+## Phase 1 — Sprint 2A: corpus manifest & PDF acquisition: COMPLETE
+
+Status date: 2026-11-22
+
+Scope was limited to *getting real PDFs onto disk and proving what they are*.
+No PDF parsing, chunking, retrieval, metrics, or golden QA work was started.
+
+FDA's Excel export lists documents but does not expose raw PDF URLs, so a
+config-only downloader would have nothing to download. Sprint 2A therefore ships
+a local-first scanner that turns hand-downloaded PDFs into manifest entries.
+
+## Delivered
+
+| Area | File | Notes |
+| --- | --- | --- |
+| Corpus schema | `configs/corpus.yaml` | `documents: []`, commented placeholder example, `example.invalid` URL only |
+| Manifest schema + scanner | `src/rag_eval/ingest/manifest.py` | Pydantic models, YAML renderer, `scan_local_pdfs`, PDF verification |
+| Downloader | `src/rag_eval/ingest/downloader.py` | Local-first, atomic `.tmp` publish, tenacity retries, always-written manifest |
+| Package exports | `src/rag_eval/ingest/__init__.py` | Public surface only |
+| CLI | `src/rag_eval/cli.py` | `corpus scan-local`, `corpus download`; Rich summary tables |
+| Tests | `tests/test_downloader.py` | 29 offline cases, `httpx.MockTransport` + `tmp_path` |
+| Dependencies | `pyproject.toml`, `uv.lock` | `rich` and `tenacity` promoted from transitive to direct |
+
+## Design decisions worth remembering
+
+1. **Local-first is structural, not conditional.** `PdfDownloader.process`
+   verifies an existing file and returns before any client is constructed, so a
+   fully local run makes exactly zero HTTP requests (asserted in the tests).
+2. **Verify before publish.** Downloads stream into `<name>.pdf.tmp`; magic
+   bytes, the 1 KiB floor, and the optional SHA-256 are checked on the temp file
+   *before* `Path.replace`. A 200-with-HTML WAF page or a truncated transfer
+   therefore never leaves a `.pdf` (or a `.tmp`) behind.
+3. **Only transient failures retry.** tenacity retries 429/502/503 and timeouts
+   with exponential jitter. 403/404 fail immediately with the exact path the
+   operator should save the file to, because FDA media endpoints reject scripted
+   clients and retrying only wastes time.
+4. **`scan-local` is the primary acquisition path.** It pins `expected_sha256`
+   from the bytes it actually saw, so a later file replacement is detected.
+   Duplicate content under a new name is skipped by hash, and colliding slugs get
+   `-2` suffixes rather than overwriting an entry.
+5. **The YAML header is canonical.** `scan-local` rewrites `corpus.yaml` from
+   `CORPUS_HEADER` + `yaml.safe_dump`, which keeps the file readable but drops
+   comments added below the header (documented in the file itself). A test pins
+   the shipped file to `render_corpus_yaml([])` so header drift is caught.
+6. **The manifest is always written**, including when every document fails, so a
+   partial run is still auditable. Exit-code policy lives only in the CLI
+   (`1` on failures unless `--allow-partial`).
+7. **An empty corpus warns instead of reporting success.** `corpus download`
+   prints `WARN no documents configured` when the manifest has zero entries. The
+   exit code stays `0` because nothing failed; the warning prevents a
+   zero-document manifest from looking like a green corpus gate.
+
+## Verification evidence
+
+```
+$ python -m uv run ruff check src tests
+All checks passed!
+
+$ python -m uv run pytest -q
+125 passed in 1.57s
+```
+
+Fully offline: every download path runs through `httpx.MockTransport`; the
+local-first tests fail if the transport handler is ever invoked.
+
+CLI smoke tests (no credentials, no network):
+
+```
+$ python -m uv run rag-eval doctor
+FAIL  no usable LLM provider            # exit 1, unchanged from Phase 0
+
+$ python -m uv run rag-eval corpus download
+total 0  ok 0  failed 0
+WARN  no documents configured in the corpus manifest
+OK    corpus is ready                   # empty corpus, manifest written, exit 0
+
+$ python -m uv run rag-eval corpus scan-local
+no PDFs found in data\raw               # exit 0
+```
+
+Banned-dependency check unchanged: no `torch`, `onnxruntime`, `transformers`,
+`sentence-transformers`, `spacy`, `docling`, `marker`, `easyocr`, `ollama`,
+`ragas`, or `deepeval`.
+
+## Not done (deliberately)
+
+- No live download was executed inside the agent loop; the corpus is still empty.
+- No PDF parsing, text extraction, chunking, index building, or metrics.
+- `configs/corpus.yaml` ships with zero documents. The 20-25 real FDA documents
+  must be added by a human with verified `source_url` values (or dropped into
+  `data/raw/` and registered with `scan-local`); no URL was guessed.
+
 ## Next phase
 
-Phase 1 should start with canonical document parsing and the citation-invariant
+Sprint 2B should start with canonical document parsing and the citation-invariant
 `(doc_id, page_num, evidence_quote, start_char, end_char)` contract, and must not
 touch retrieval metrics until the golden QA schema exists.

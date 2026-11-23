@@ -1,0 +1,61 @@
+"""Corpus ingestion: manifest schema, local PDF scanning, and acquisition."""
+
+from __future__ import annotations
+
+from rag_eval.ingest.downloader import (
+    DownloadError,
+    DownloadSummary,
+    PdfDownloader,
+    build_client,
+    download_corpus,
+)
+from rag_eval.ingest.manifest import (
+    DEFAULT_CATEGORY,
+    DEFAULT_CORPUS_CONFIG_PATH,
+    DEFAULT_MANIFEST_FILENAME,
+    DEFAULT_RAW_DIR,
+    MIN_PDF_BYTES,
+    PDF_MAGIC,
+    CorpusConfig,
+    CorpusDocument,
+    ManifestEntry,
+    ManifestError,
+    PdfValidationError,
+    ScanResult,
+    load_corpus_config,
+    render_corpus_yaml,
+    scan_local_pdfs,
+    sha256_file,
+    slugify,
+    verify_pdf_file,
+    write_corpus_config,
+    write_manifest,
+)
+
+__all__ = [
+    "DEFAULT_CATEGORY",
+    "DEFAULT_CORPUS_CONFIG_PATH",
+    "DEFAULT_MANIFEST_FILENAME",
+    "DEFAULT_RAW_DIR",
+    "MIN_PDF_BYTES",
+    "PDF_MAGIC",
+    "CorpusConfig",
+    "CorpusDocument",
+    "DownloadError",
+    "DownloadSummary",
+    "ManifestEntry",
+    "ManifestError",
+    "PdfDownloader",
+    "PdfValidationError",
+    "ScanResult",
+    "build_client",
+    "download_corpus",
+    "load_corpus_config",
+    "render_corpus_yaml",
+    "scan_local_pdfs",
+    "sha256_file",
+    "slugify",
+    "verify_pdf_file",
+    "write_corpus_config",
+    "write_manifest",
+]

@@ -1025,6 +1025,8 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
+    { name = "rich" },
+    { name = "tenacity" },
     { name = "typer" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
@@ -1043,6 +1045,8 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.14.4" },
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "rich", specifier = ">=15.0.0" },
+    { name = "tenacity", specifier = ">=9.1.4" },
     { name = "typer", specifier = ">=0.29.2" },
     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2026.6" },
 ]

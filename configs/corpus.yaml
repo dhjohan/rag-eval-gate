@@ -1,0 +1,39 @@
+# Corpus manifest for the rag-eval-gate FDA digital-health PDF set.
+#
+# Target: 20-25 PDFs from FDA's digital-health / software-as-a-medical-device
+# material. FDA's own Excel export does not expose raw PDF URLs, so this file is
+# the single source of truth for what the corpus contains and where it came from.
+#
+# Each document entry accepts:
+#   doc_id          required  lowercase slug, unique, e.g. fda-ai-ml-action-plan
+#   title           required  human-readable document title
+#   category        optional  defaults to fda_digital_health
+#   effective_date  optional  YYYY-MM-DD
+#   source_url      optional  absolute http(s) URL to the PDF
+#   local_filename  optional  bare *.pdf file name inside --raw-dir
+#   expected_sha256 optional  64 hex chars; verified after download and on reuse
+#
+# Every entry needs source_url, local_filename, or both. Path resolution is
+# `data/raw/{local_filename}` when local_filename is set, else
+# `data/raw/{doc_id}.pdf`. A document that is already on disk is verified and
+# reused; only missing documents are fetched.
+#
+# Acquisition workflow:
+#   1. Drop PDFs into data/raw/ (manual browser download if the host blocks us).
+#   2. Run `rag-eval corpus scan-local` to register them with their sha256.
+#   3. Run `rag-eval corpus download` to verify local files and fetch the rest.
+#
+# NOTE: `rag-eval corpus scan-local` rewrites this file from a canonical header.
+# Comments added below this header are not preserved.
+#
+# Example (replace the placeholder URL with the real one; never guess FDA URLs):
+# documents:
+#   - doc_id: fda-example-guidance
+#     title: "Example guidance document"
+#     category: fda_digital_health
+#     effective_date: 2024-01-15
+#     source_url: https://example.invalid/replace-with-real-url.pdf
+#     local_filename: fda-example-guidance.pdf
+#     expected_sha256: null
+schema_version: 1
+documents: []
