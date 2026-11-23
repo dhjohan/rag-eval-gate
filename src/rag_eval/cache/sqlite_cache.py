@@ -19,7 +19,23 @@ from typing import Any
 
 import numpy as np
 
-_SCHEMA = """
+_LLM_RESPONSES_DDL = """
+CREATE TABLE IF NOT EXISTS llm_responses (
+    prompt_sha256   TEXT NOT NULL,
+    target          TEXT NOT NULL,
+    provider_used   TEXT NOT NULL,
+    requested_model TEXT NOT NULL,
+    model_used      TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    usage_tokens    INTEGER NOT NULL,
+    latency_ms      INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (prompt_sha256, target, provider_used, requested_model)
+);
+"""
+
+_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS embedding_cache (
     content_sha256 TEXT NOT NULL,
     model_id       TEXT NOT NULL,
@@ -28,19 +44,9 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     created_at     TEXT NOT NULL,
     PRIMARY KEY (content_sha256, model_id, dims)
 );
-
-CREATE TABLE IF NOT EXISTS llm_responses (
-    prompt_sha256 TEXT NOT NULL,
-    target        TEXT NOT NULL,
-    content       TEXT NOT NULL,
-    provider_used TEXT NOT NULL,
-    model_used    TEXT NOT NULL,
-    usage_tokens  INTEGER NOT NULL,
-    latency_ms    INTEGER NOT NULL,
-    created_at    TEXT NOT NULL,
-    PRIMARY KEY (prompt_sha256, target)
-);
-
+"""
+    + _LLM_RESPONSES_DDL
+    + """
 CREATE TABLE IF NOT EXISTS quota_usage (
     provider    TEXT NOT NULL,
     window_date TEXT NOT NULL,
@@ -48,6 +54,7 @@ CREATE TABLE IF NOT EXISTS quota_usage (
     PRIMARY KEY (provider, window_date)
 );
 """
+)
 
 
 def sha256_text(text: str) -> str:
@@ -83,6 +90,32 @@ class SqliteCache:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate_llm_cache()
+
+    def _migrate_llm_cache(self) -> None:
+        """Add ``requested_model`` to prompt caches created before it existed.
+
+        The cache is derived data, but silently failing on ``ON CONFLICT`` after
+        an upgrade is worse than a one-off table rebuild. Old rows are kept and
+        their stored model becomes both the requested and the actual model.
+        """
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(llm_responses)").fetchall()
+        }
+        if "requested_model" in columns:
+            return
+        self._conn.execute("ALTER TABLE llm_responses RENAME TO llm_responses_legacy")
+        self._conn.execute(_LLM_RESPONSES_DDL)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO llm_responses "
+            "(prompt_sha256, target, provider_used, requested_model, model_used, "
+            "content, usage_tokens, latency_ms, created_at) "
+            "SELECT prompt_sha256, target, provider_used, model_used, model_used, "
+            "content, usage_tokens, latency_ms, created_at "
+            "FROM llm_responses_legacy"
+        )
+        self._conn.execute("DROP TABLE llm_responses_legacy")
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -136,12 +169,21 @@ class SqliteCache:
 
     # -- LLM prompt cache --------------------------------------------------
 
-    def get_llm_response(self, prompt_sha256: str, target: str) -> CachedLLMResponse | None:
+    def get_llm_response(
+        self,
+        prompt_sha256: str,
+        target: str,
+        *,
+        provider_used: str,
+        requested_model: str,
+    ) -> CachedLLMResponse | None:
         with self._lock:
             row = self._conn.execute(
                 "SELECT content, provider_used, model_used, usage_tokens, latency_ms "
-                "FROM llm_responses WHERE prompt_sha256 = ? AND target = ?",
-                (prompt_sha256, target),
+                "FROM llm_responses "
+                "WHERE prompt_sha256 = ? AND target = ? "
+                "AND provider_used = ? AND requested_model = ?",
+                (prompt_sha256, target, provider_used, requested_model),
             ).fetchone()
         if row is None:
             return None
@@ -160,6 +202,7 @@ class SqliteCache:
         *,
         content: str,
         provider_used: str,
+        requested_model: str,
         model_used: str,
         usage_tokens: int,
         latency_ms: int,
@@ -167,17 +210,19 @@ class SqliteCache:
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO llm_responses (prompt_sha256, target, content, provider_used, "
-                "model_used, usage_tokens, latency_ms, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(prompt_sha256, target) DO UPDATE SET "
-                "content = excluded.content, provider_used = excluded.provider_used, "
-                "model_used = excluded.model_used, usage_tokens = excluded.usage_tokens, "
+                "requested_model, model_used, usage_tokens, latency_ms, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(prompt_sha256, target, provider_used, requested_model) "
+                "DO UPDATE SET "
+                "content = excluded.content, model_used = excluded.model_used, "
+                "usage_tokens = excluded.usage_tokens, "
                 "latency_ms = excluded.latency_ms, created_at = excluded.created_at",
                 (
                     prompt_sha256,
                     target,
                     content,
                     provider_used,
+                    requested_model,
                     model_used,
                     usage_tokens,
                     latency_ms,

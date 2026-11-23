@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -160,7 +161,21 @@ class LLMRouter:
         )
 
         if cache_enabled:
-            cached = self._cache.get_llm_response(prompt_hash, target)
+            # A cached answer is only valid for the provider/model that produced
+            # it, so probe each candidate provider's cache entry before going
+            # to the network. The first hit wins.
+            cached = None
+            for name in self._candidate_order(response_model):
+                cfg = self._config.providers[name]
+                candidate = self._cache.get_llm_response(
+                    prompt_hash,
+                    target,
+                    provider_used=name,
+                    requested_model=cfg.model,
+                )
+                if candidate is not None:
+                    cached = candidate
+                    break
             if cached is not None:
                 parsed = None
                 if response_model is not None:
@@ -210,6 +225,7 @@ class LLMRouter:
                     target,
                     content=result.content,
                     provider_used=result.provider_used,
+                    requested_model=cfg.model,
                     model_used=result.model_used,
                     usage_tokens=result.usage_tokens,
                     latency_ms=result.latency_ms,
@@ -442,6 +458,14 @@ def _extract_content(body: Any) -> str:
 
 def _parse_structured(text: str, response_model: type[BaseModel]) -> BaseModel:
     cleaned = text.strip()
+    # Reasoning models (e.g. Nemotron Ultra) wrap answers in
+    # <think>...</think> blocks; strip them before JSON parsing.
+    cleaned = re.sub(
+        r"\x3cthink\x3e.*?\x3c/think\x3e",
+        "",
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
     if cleaned.startswith("```"):
         cleaned = cleaned[3:]
         if cleaned[:4].lower() == "json":

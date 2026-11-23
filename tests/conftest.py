@@ -53,16 +53,38 @@ def provider() -> Callable[..., dict[str, Any]]:
 
 @pytest.fixture
 def llm_config() -> Callable[..., LLMConfig]:
-    def _make(providers: dict[str, Any], order: list[str] | None = None) -> LLMConfig:
-        return LLMConfig.model_validate(
-            {
-                "order": order if order is not None else list(providers),
-                "providers": providers,
-                "max_retries": 1,
-                "backoff_base_s": 0.01,
-                "backoff_cap_s": 0.05,
-            }
-        )
+    def _make(
+        providers: dict[str, Any],
+        order: list[str] | None = None,
+        **overrides: Any,
+    ) -> LLMConfig:
+        payload: dict[str, Any] = {
+            "order": order if order is not None else list(providers),
+            "providers": providers,
+            "max_retries": 1,
+            "backoff_base_s": 0.01,
+            "backoff_cap_s": 0.05,
+        }
+        payload.update(overrides)
+        return LLMConfig.model_validate(payload)
+
+    return _make
+
+
+@pytest.fixture
+def embedding_provider() -> Callable[..., dict[str, Any]]:
+    def _make(**overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "enabled": True,
+            "base_url": "https://embed.test/v1",
+            "model": "gemini-embedding-2",
+            "api_key_env": "TEST_API_KEY",
+            "dims": 64,
+            "task_type": "RETRIEVAL_DOCUMENT",
+            "timeout_s": 5,
+        }
+        base.update(overrides)
+        return base
 
     return _make
 

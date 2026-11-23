@@ -44,24 +44,6 @@ class RecordingBackend:
         return len(self.calls)
 
 
-@pytest.fixture
-def embedding_provider() -> Callable[..., dict[str, Any]]:
-    def _make(**overrides: Any) -> dict[str, Any]:
-        base: dict[str, Any] = {
-            "enabled": True,
-            "base_url": "https://embed.test/v1",
-            "model": "gemini-embedding-2",
-            "api_key_env": "TEST_API_KEY",
-            "dims": DIMS,
-            "task_type": "RETRIEVAL_DOCUMENT",
-            "timeout_s": 5,
-        }
-        base.update(overrides)
-        return base
-
-    return _make
-
-
 def make_client(
     config: EmbeddingsConfig,
     cache: SqliteCache,
@@ -74,6 +56,7 @@ def make_client(
         cache,
         api_key_resolver=lambda name: "secret" if name in keys else None,
         backend_factory=lambda name, cfg, key: backends[name],
+        sleep=lambda _: None,
     )
 
 
@@ -219,7 +202,12 @@ def test_unsupported_embedding_model_is_reported(
     cache: SqliteCache,
 ) -> None:
     config = embeddings_config({"google": embedding_provider(model="text-embedding-3-small")})
-    client = EmbeddingClient(config, cache, api_key_resolver=lambda name: "secret")
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        sleep=lambda _: None,
+    )
 
     with pytest.raises(AllEmbeddingProvidersFailed, match="unsupported embedding model"):
         client.embed_texts(["alpha"])

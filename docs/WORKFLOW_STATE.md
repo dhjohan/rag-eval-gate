@@ -23,7 +23,7 @@ metrics, or dashboards were implemented.
 | Rerank | `src/rag_eval/providers/rerank.py` | Jina reranker client |
 | CLI | `src/rag_eval/cli.py` | `doctor`, `cache-stats` |
 | CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard |
-| Tests | `tests/` | 88 offline tests |
+| Tests | `tests/` | 96 offline tests |
 
 ## Provider catalog verification (2026-11-22)
 
@@ -70,9 +70,12 @@ Gemini limits are per **project** (not per key) and reset at midnight Pacific.
    tries `json_schema` providers first, then `json_object`, then prompt-embedded
    schema, so `nvidia_ultra` (no `response_format`) is never chosen over a
    schema-capable provider.
-3. **The cache stores the model that actually answered.** `openrouter/free` may
-   route to any free model, so `model_used` comes from the response body and is
-   replayed on cache hits.
+3. **The prompt cache is keyed by the requested model, not the routed one.**
+   `(prompt_sha256, target, provider_used, requested_model)` identifies an entry,
+   while `model_used` records which model actually answered and is replayed on a
+   hit. This keeps `openrouter/free` cacheable without letting a configured
+   model change reuse stale output. Databases created before `requested_model`
+   existed are migrated in place on open.
 4. **Embedding fallback is opt-in.** Mixing providers would mix vector spaces,
    so `fallback_enabled: false` means only the first provider is used. When
    enabled, the *entire* batch is re-embedded by the fallback provider.
@@ -86,7 +89,7 @@ $ python -m uv run ruff check src tests
 All checks passed!
 
 $ python -m uv run pytest -q
-88 passed in 0.79s
+96 passed in 0.86s
 ```
 
 The suite runs fully offline: every HTTP interaction goes through

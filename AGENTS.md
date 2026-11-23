@@ -10,9 +10,9 @@ Build an evals-first, CI-gated RAG system over a real messy corpus using **100% 
    - NEVER add `torch`, `transformers`, `sentence-transformers`, `spacy`, `docling`, `marker`, `unstructured[all-docs]`, `easyocr`, `ollama`, or `qdrant-client[fastembed]` to dependencies.
    - Local machine has strict RAM/CPU limits. PDF parsing MUST use pure CPU libraries (`pymupdf`, `pdfplumber`). Vector similarity MUST use pure `numpy` + SQLite, `qdrant-client` (local disk/memory without fastembed), or Qdrant Cloud Free Tier. Lexical search MUST use SQLite FTS5.
 2. **100% FREE-TIER CLOUD APIs ONLY**:
-   - Embeddings: Google `gemini-embedding-001` (via `google-genai`) and/or Jina AI embeddings API (`httpx`).
+   - Embeddings: Google `gemini-embedding-2` (via `google-genai`) and/or Jina AI embeddings API (`httpx`).
    - Reranking: Jina AI Reranker API (`httpx`).
-   - Generation & Judge: Multi-provider OpenAI-compatible/SDK router supporting Groq Free, Gemini AI Studio Free, and OpenRouter `:free`.
+   - Generation & Judge: Multi-provider OpenAI-compatible/SDK router supporting NVIDIA NIM, Cloudflare Workers AI, and OpenRouter `:free`. Groq Free and Gemini AI Studio Free were dropped by explicit decision (Groq is geo-blocked; Gemini chat free-tier quotas are unpublished/too strict).
    - Every embedding call MUST check a local SQLite hash cache `(content_sha256, model_id, dims)` before hitting the network.
    - Every generative LLM call MUST go through a token-bucket rate limiter, exponential backoff retry handler, and optional SQLite prompt cache.
 3. **NO MULTI-CALL EVAL FRAMEWORKS**:

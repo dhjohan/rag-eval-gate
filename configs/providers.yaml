@@ -85,9 +85,8 @@ llm:
 # Embeddings. 768 dims on both sides so vectors stay interchangeable.
 # gemini-embedding-2 supports 768 natively; jina-embeddings-v5-text-nano is
 # natively 768. If Google embedding quotas prove too strict, swap `order` so
-# Jina is primary. batch_size is intentionally omitted: the client ignores it
-# (Google embedding-2 aggregates multi-input requests, so each chunk is sent
-# one at a time to keep cache keys 1:1).
+# Jina is primary. (Google embedding-2 aggregates multi-input requests, so each
+# chunk is sent one at a time to keep cache keys 1:1).
 # ---------------------------------------------------------------------------
 embeddings:
   fallback_enabled: false # opt-in: mixing providers would mix vector spaces

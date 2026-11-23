@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -44,12 +47,18 @@ def test_llm_response_roundtrip_preserves_actual_model(cache: SqliteCache) -> No
         "Verdict",
         content='{"score": 1}',
         provider_used="openrouter_free",
+        requested_model="openrouter/free",
         model_used="nvidia/nemotron-3.5-super-vl:free",
         usage_tokens=42,
         latency_ms=900,
     )
 
-    cached = cache.get_llm_response(digest, "Verdict")
+    cached = cache.get_llm_response(
+        digest,
+        "Verdict",
+        provider_used="openrouter_free",
+        requested_model="openrouter/free",
+    )
 
     assert cached is not None
     assert cached.model_used == "nvidia/nemotron-3.5-super-vl:free"
@@ -65,11 +74,73 @@ def test_llm_response_is_scoped_by_target(cache: SqliteCache) -> None:
         "Verdict",
         content="{}",
         provider_used="a",
+        requested_model="m",
         model_used="m",
         usage_tokens=1,
         latency_ms=1,
     )
-    assert cache.get_llm_response(digest, "freeform") is None
+    assert (
+        cache.get_llm_response(digest, "freeform", provider_used="a", requested_model="m")
+        is None
+    )
+
+
+def test_llm_response_is_scoped_by_requested_model(cache: SqliteCache) -> None:
+    digest = sha256_text("prompt")
+    cache.put_llm_response(
+        digest,
+        "freeform",
+        content="x",
+        provider_used="a",
+        requested_model="model-a",
+        model_used="actual/model-a",
+        usage_tokens=1,
+        latency_ms=1,
+    )
+
+    assert (
+        cache.get_llm_response(digest, "freeform", provider_used="a", requested_model="model-b")
+        is None
+    )
+
+
+def test_legacy_llm_cache_is_migrated(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.sqlite3"
+    digest = sha256_text("legacy prompt")
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE llm_responses (
+            prompt_sha256 TEXT NOT NULL,
+            target        TEXT NOT NULL,
+            content       TEXT NOT NULL,
+            provider_used TEXT NOT NULL,
+            model_used    TEXT NOT NULL,
+            usage_tokens  INTEGER NOT NULL,
+            latency_ms    INTEGER NOT NULL,
+            created_at    TEXT NOT NULL,
+            PRIMARY KEY (prompt_sha256, target)
+        );
+        """
+    )
+    connection.execute(
+        "INSERT INTO llm_responses VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (digest, "Verdict", "{}", "a", "m", 2, 5, "2026-11-22T00:00:00+00:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    with SqliteCache(db_path) as cache:
+        cached = cache.get_llm_response(
+            digest,
+            "Verdict",
+            provider_used="a",
+            requested_model="m",
+        )
+
+    assert cached is not None
+    assert cached.model_used == "m"
+    assert cached.usage_tokens == 2
 
 
 def test_quota_stops_at_limit(cache: SqliteCache) -> None:
@@ -106,6 +177,7 @@ def test_stats_counts_each_table(cache: SqliteCache) -> None:
         "freeform",
         content="x",
         provider_used="p",
+        requested_model="m",
         model_used="m",
         usage_tokens=1,
         latency_ms=1,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -11,8 +11,26 @@ import pytest
 from pydantic import BaseModel
 
 from rag_eval.cache.sqlite_cache import SqliteCache
-from rag_eval.config import LLMConfig
+from rag_eval.config import EmbeddingsConfig, LLMConfig
+from rag_eval.providers.embeddings import EmbeddingClient, EmbeddingError
 from rag_eval.providers.llm import AllProvidersFailed, LLMRouter
+
+
+class RecordingBackend:
+    def __init__(self, *, fail: bool = False, dims: int = 64) -> None:
+        self.calls: list[tuple[list[str], str | None]] = []
+        self._fail = fail
+        self._dims = dims
+
+    def embed(self, texts: Sequence[str], *, task_type: str | None) -> list[list[float]]:
+        self.calls.append((list(texts), task_type))
+        if self._fail:
+            raise EmbeddingError("provider exploded")
+        return [[1.0] + [0.0] * (self._dims - 1) for _ in texts]
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
 
 
 class Verdict(BaseModel):
@@ -297,6 +315,120 @@ def test_5xx_keeps_quota_slot(
     assert cache.get_quota_used("a", today) == 1
 
 
+def test_llm_cache_key_includes_provider_and_model(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    # Same prompt, same temperature, different model/provider: must NOT be a
+    # stale cache hit.
+    providers = {
+        "a": provider(base_url="https://a.test/v1", model="model-A"),
+        "b": provider(base_url="https://b.test/v1", model="model-B"),
+    }
+    config = llm_config(providers, order=["a", "b"], max_retries=0)
+
+    calls = 0
+
+    def handler(request: httpx.Request, n: int) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        body = request.read().decode()
+        model = "model-A" if "model-A" in body else "model-B"
+        return httpx.Response(
+            200,
+            json=ok_body(content=f"reply from {model}", model=model),
+        )
+
+    router, _calls = make_router(config, cache, handler, keys=("TEST_API_KEY",))
+
+    first = router.generate([{"role": "user", "content": "hi"}])
+    assert first.provider_used == "a"
+    assert first.model_used == "model-A"
+    assert first.cache_hit is False
+
+    second = router.generate([{"role": "user", "content": "hi"}])
+    # Same provider + same model: must be a cache hit.
+    assert second.provider_used == "a"
+    assert second.model_used == "model-A"
+    assert second.cache_hit is True
+    assert calls == 1
+
+
+def test_think_tags_stripped_before_structured_parse(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    providers = {
+        "a": provider(base_url="https://a.test/v1"),
+    }
+    config = llm_config(providers, order=["a"], max_retries=0)
+
+    def handler(request: httpx.Request, n: int) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=ok_body(
+                content=(
+                    "<think>checking the rubric</think>\n"
+                    '```json\n{"score": 7, "reason": "ok"}\n```'
+                ),
+                model="nvidia/nemotron-3-ultra-550b-a55b",
+            ),
+        )
+
+    router, _calls = make_router(config, cache, handler, keys=("TEST_API_KEY",))
+
+    result = router.generate(
+        [{"role": "user", "content": "judge this"}],
+        response_model=Verdict,
+    )
+
+    assert result.provider_used == "a"
+    assert result.parsed is not None
+    assert result.parsed.score == 7
+    assert result.parsed.reason == "ok"
+
+
+def test_embedding_retry_after_transport_error(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    providers = {
+        "google": embedding_provider(base_url="https://g.test/v1"),
+    }
+    config = embeddings_config(providers, order=["google"], fallback=False)
+    backend = RecordingBackend(fail=True)
+
+    attempts = 0
+
+    def unit_vector() -> list[float]:
+        return [1.0] + [0.0] * 63
+
+    def flaky_embed(texts: Sequence[str], *, task_type: str | None) -> list[list[float]]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 2:
+            raise EmbeddingError("transient failure")
+        return [unit_vector() for _ in texts]
+
+    backend.embed = flaky_embed  # type: ignore[method-assign]
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: backend,
+        sleep=lambda _: None,
+    )
+
+    result = client.embed_texts(["alpha"])
+
+    assert attempts == 2
+    assert result.provider_used == "google"
+    assert result.cache_misses == 1
+
+
 def test_all_providers_failing_raises_with_reasons(
     provider: Callable[..., dict[str, Any]],
     llm_config: Callable[..., LLMConfig],
@@ -449,7 +581,7 @@ def test_openrouter_reports_the_actual_routed_model(
     cache: SqliteCache,
 ) -> None:
     config = llm_config({"openrouter_free": provider(model="openrouter/free")})
-    router, _ = make_router(
+    router, calls = make_router(
         config,
         cache,
         lambda req, n: httpx.Response(
@@ -457,9 +589,15 @@ def test_openrouter_reports_the_actual_routed_model(
         ),
     )
 
-    result = router.generate([{"role": "user", "content": "hi"}])
+    first = router.generate([{"role": "user", "content": "hi"}])
+    second = router.generate([{"role": "user", "content": "hi"}])
 
-    assert result.model_used == "nvidia/nemotron-3.5-super-vl:free"
+    assert first.model_used == "nvidia/nemotron-3.5-super-vl:free"
+    # The cache is keyed by the requested model, while the routed model is
+    # replayed as provenance.
+    assert second.cache_hit is True
+    assert second.model_used == "nvidia/nemotron-3.5-super-vl:free"
+    assert len(calls) == 1
 
 
 def test_extra_headers_are_sent(

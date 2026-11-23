@@ -180,7 +180,6 @@ class EmbeddingProviderConfig(_HttpProvider):
     model: str = Field(min_length=1)
     dims: int = Field(default=768, ge=64, le=3072)
     task_type: str | None = None
-    batch_size: int = Field(default=16, ge=1, le=256)
 
 
 class EmbeddingsConfig(_StrictModel):

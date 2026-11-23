@@ -7,6 +7,8 @@ the next provider rather than stitched together from two models.
 
 from __future__ import annotations
 
+import random
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -16,6 +18,7 @@ import numpy as np
 
 from rag_eval.cache.sqlite_cache import SqliteCache, sha256_text
 from rag_eval.config import EmbeddingProviderConfig, EmbeddingsConfig, resolve_api_key
+from rag_eval.providers.rate_limit import compute_backoff
 
 _JINA_TASKS = {
     "RETRIEVAL_DOCUMENT": "retrieval.passage",
@@ -173,6 +176,11 @@ class EmbeddingClient:
             Callable[[str, EmbeddingProviderConfig, str], EmbeddingBackend] | None
         ) = None,
         transport: httpx.BaseTransport | None = None,
+        max_retries: int = 2,
+        backoff_base_s: float = 1.0,
+        backoff_cap_s: float = 30.0,
+        sleep: Callable[[float], None] = time.sleep,
+        rng: random.Random | None = None,
     ) -> None:
         self._config = config
         self._cache = cache
@@ -180,6 +188,11 @@ class EmbeddingClient:
         self._backend_factory = backend_factory or (
             lambda name, cfg, key: _default_backend(name, cfg, key, transport)
         )
+        self._max_retries = max_retries
+        self._backoff_base_s = backoff_base_s
+        self._backoff_cap_s = backoff_cap_s
+        self._sleep = sleep
+        self._rng = rng or random.Random(0)
 
     def embed_texts(
         self,
@@ -225,25 +238,41 @@ class EmbeddingClient:
                 )
 
             missing = [index for index, vector in enumerate(cached) if vector is None]
-            backend: EmbeddingBackend | None = None
-            try:
-                backend = self._backend_factory(name, cfg, api_key)
-                fresh = backend.embed(
-                    [texts[index] for index in missing], task_type=effective_task
-                )
-                if len(fresh) != len(missing):
-                    raise EmbeddingError(
-                        f"returned {len(fresh)} vectors for {len(missing)} inputs"
+            fresh: list[list[float]] | None = None
+            normalised: list[np.ndarray] | None = None
+            for attempt in range(self._max_retries + 1):
+                backend: EmbeddingBackend | None = None
+                try:
+                    backend = self._backend_factory(name, cfg, api_key)
+                    fresh = backend.embed(
+                        [texts[index] for index in missing], task_type=effective_task
                     )
-                normalised = [_normalise(vector, cfg.dims) for vector in fresh]
-            except EmbeddingError as exc:
-                failures.append(f"{name}: {exc}")
+                    if len(fresh) != len(missing):
+                        raise EmbeddingError(
+                            f"returned {len(fresh)} vectors for {len(missing)} inputs"
+                        )
+                    normalised = [_normalise(vector, cfg.dims) for vector in fresh]
+                    break
+                except EmbeddingError as exc:
+                    if attempt < self._max_retries:
+                        self._sleep(
+                            compute_backoff(
+                                attempt,
+                                base_s=self._backoff_base_s,
+                                cap_s=self._backoff_cap_s,
+                                rng=self._rng,
+                            )
+                        )
+                        continue
+                    failures.append(f"{name}: {exc}")
+                    break
+                finally:
+                    if backend is not None:
+                        close = getattr(backend, "close", None)
+                        if callable(close):
+                            close()
+            if fresh is None or normalised is None:
                 continue
-            finally:
-                if backend is not None:
-                    close = getattr(backend, "close", None)
-                    if callable(close):
-                        close()
 
             for index, vector in zip(missing, normalised, strict=True):
                 self._cache.put_embedding(hashes[index], model_id, cfg.dims, vector)
