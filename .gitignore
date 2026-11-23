@@ -223,3 +223,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local corpus artifacts (PDFs and the generated manifest are never committed)
+data/raw/

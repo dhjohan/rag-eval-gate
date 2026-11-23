@@ -1,0 +1,122 @@
+schema_version: 1
+
+# ---------------------------------------------------------------------------
+# LLM chain. Ordered fallback: the first provider that is configured, has not
+# exhausted its daily budget, and answers successfully wins.
+#
+# Available free tiers in this environment:
+#   NVIDIA NIM ......... 40 RPM / 10,000 RPD (published) -> configured 35/9000
+#   Cloudflare Workers AI 10,000 Neurons/day, resets 00:00 UTC -> self-imposed 60/500
+#   OpenRouter ......... 50 free requests/day under 10 credits -> 20/50
+#
+# Google Gemini chat models are deliberately OUT of the active chain: their
+# free-tier RPM/RPD are per-project, unpublished, and too strict for this
+# workload (values like 4/20 are unverified guesses). Re-add them here if you
+# have a confirmed higher project quota.
+# ---------------------------------------------------------------------------
+llm:
+  max_retries: 2
+  backoff_base_s: 1.0
+  backoff_cap_s: 30.0
+  prompt_cache_enabled: true
+
+  order:
+    - nvidia_super
+    - nvidia_ultra
+    - cloudflare_gpt_oss
+    - openrouter_free
+
+  providers:
+    nvidia_super:
+      enabled: true
+      base_url: https://integrate.api.nvidia.com/v1
+      model: nvidia/nemotron-3.5-super-vl-120b-a12b
+      api_key_env: NVIDIA_API_KEY
+      rpm: 35 # published cap is 40; leave headroom for retries
+      rpd: 9000 # published cap is 10,000
+      rpd_timezone: UTC
+      structured_output: json_schema # UNVERIFIED against live NIM docs
+      supports_reasoning: true
+      max_tokens: 2048
+      timeout_s: 120
+
+    nvidia_ultra:
+      enabled: true
+      base_url: https://integrate.api.nvidia.com/v1
+      model: nvidia/nemotron-3-ultra-550b-a55b
+      api_key_env: NVIDIA_API_KEY
+      rpm: 35
+      rpd: 9000
+      rpd_timezone: UTC
+      structured_output: none # the NIM API reference exposes no response_format
+      supports_reasoning: true
+      max_tokens: 2048
+      timeout_s: 180
+
+    cloudflare_gpt_oss:
+      enabled: true
+      base_url: https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1
+      model: "@cf/openai/gpt-oss-120b"
+      api_key_env: CLOUDFLARE_API_TOKEN
+      rpm: 60
+      rpd: 500 # self-imposed; the real budget is 10,000 Neurons/day
+      rpd_timezone: UTC
+      structured_output: json_schema # schema-valid; live compliance unverified
+      supports_reasoning: true
+      max_tokens: 2048
+      timeout_s: 120
+
+    openrouter_free:
+      enabled: true
+      base_url: https://openrouter.ai/api/v1
+      model: openrouter/free
+      api_key_env: OPENROUTER_API_KEY
+      rpm: 20
+      rpd: 50
+      rpd_timezone: UTC
+      structured_output: json_schema
+      supports_reasoning: false
+      max_tokens: 2048
+      timeout_s: 60
+      extra_headers:
+        X-Title: rag-eval-gate
+
+# ---------------------------------------------------------------------------
+# Embeddings. 768 dims on both sides so vectors stay interchangeable.
+# gemini-embedding-2 supports 768 natively; jina-embeddings-v5-text-nano is
+# natively 768. If Google embedding quotas prove too strict, swap `order` so
+# Jina is primary. (Google embedding-2 aggregates multi-input requests, so each
+# chunk is sent one at a time to keep cache keys 1:1).
+# ---------------------------------------------------------------------------
+embeddings:
+  fallback_enabled: false # opt-in: mixing providers would mix vector spaces
+  order:
+    - google
+    - jina
+
+  providers:
+    google:
+      enabled: true
+      base_url: https://generativelanguage.googleapis.com/v1beta
+      model: gemini-embedding-2
+      api_key_env: GEMINI_API_KEY
+      dims: 768
+      task_type: RETRIEVAL_DOCUMENT
+      timeout_s: 60
+
+    jina:
+      enabled: true
+      base_url: https://api.jina.ai/v1
+      model: jina-embeddings-v5-text-nano
+      api_key_env: JINA_API_KEY
+      dims: 768
+      task_type: RETRIEVAL_DOCUMENT
+      timeout_s: 60
+
+rerank:
+  enabled: true
+  base_url: https://api.jina.ai/v1
+  model: jina-reranker-v3.5
+  api_key_env: JINA_API_KEY
+  top_n: 10
+  timeout_s: 60
