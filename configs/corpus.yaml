@@ -108,10 +108,9 @@ documents:
   local_filename: Guidance-DSF-MMA.pdf
   expected_sha256: 7fb21371f814ec843c208e2b98e3505a7f4f47aa845040a419af4929e95d053e
 - doc_id: guidance-medical-device-accessories-describing-accessories-and-classification-pa
-  title: Guidance Medical Device Accessories Describing Accessories and Classification Pathways (1)
+  title: Guidance Medical Device Accessories Describing Accessories and Classification Pathways
   category: fda_digital_health
-  local_filename: Guidance-Medical-Device-Accessories-Describing-Accessories-and-Classification-Pathways
-    (1).pdf
+  local_filename: Guidance-Medical-Device-Accessories-Describing-Accessories-and-Classification-Pathways.pdf
   expected_sha256: ba4ce9b4fe8638d8aa6a74e683e2fa329c02e90be98890544bf6d1289fd941c0
 - doc_id: guidance-predetermined-change-control-ai
   title: Guidance Predetermined Change Control AI
