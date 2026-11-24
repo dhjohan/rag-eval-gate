@@ -224,5 +224,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Local corpus artifacts (PDFs and the generated manifest are never committed)
+# Local corpus artifacts (PDFs, manifests, and parsed canonical JSON are local state)
 data/raw/
+data/processed/

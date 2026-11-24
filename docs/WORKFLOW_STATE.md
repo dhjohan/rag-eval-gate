@@ -23,7 +23,7 @@ metrics, or dashboards were implemented.
 | Rerank | `src/rag_eval/providers/rerank.py` | Jina reranker client |
 | CLI | `src/rag_eval/cli.py` | `doctor`, `cache-stats` |
 | CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard; mypy type check on push/PR |
-| Tests | `tests/` | 203 offline tests |
+| Tests | `tests/` | 227 offline tests |
 
 ## Provider catalog verification (2026-11-22)
 
@@ -352,15 +352,71 @@ All tests are offline: synthetic PDFs are written to `tmp_path` with pymupdf and
 token counting is injected. The real 21-document corpus was **not** parsed in the
 agent loop; the operator runs `rag-eval corpus parse && rag-eval corpus stats`.
 
+## Phase 2 — Sprint 3A: golden QA schema + annotation workbench: COMPLETE
+
+Status date: 2026-11-24
+
+Scope was the golden QA *schema, validator, split generator, and a local
+annotation UI*. No golden QA items were generated here (they are hand-written);
+no chunking, vector index, retrieval, or metrics were started.
+
+### Delivered
+
+| Area | File | Notes |
+| --- | --- | --- |
+| Models | `src/rag_eval/evals/dataset.py` | `CitationAnchor`, `GoldenQAItem`; frozen, `extra="forbid"`, declarative `str_strip_whitespace` + `min_length=1` |
+| Validator | `src/rag_eval/evals/dataset_validator.py` | Page-scoped quote resolution, whitespace-flexible regex, cross-page spans, ambiguity rejection, wrong-page suggestions, deterministic smoke split |
+| Workbench | `src/rag_eval/tools/annotator_app.py` | Optional Streamlit UI, lazily imported; raw `page.text` viewer; dynamic citations; verify-alignment; JSONL upsert |
+| CLI | `src/rag_eval/cli.py` | `dataset validate`, `dataset stats` |
+| Fixture | `tests/fixtures/sample_golden_qa.jsonl` | 5 schema fixtures (single-fact, whitespace, multi-citation, unanswerable, tabular) |
+| Tests | `tests/test_dataset_validator.py` | 24 offline tests |
+| Dependencies | `pyproject.toml`, `uv.lock` | `streamlit>=1.38` only under `[project.optional-dependencies] ui`; mypy override |
+
+### Design decisions
+
+1. **Offsets are always true `full_text` indices.** The primary search runs on
+   the page slice; the whitespace fallback is `r"\s+".join(re.escape(tok) ...)`
+   run directly on `full_text[...]`, never on a separately normalized string.
+2. **Cross-page spans use the combined contiguous slice**
+   `full_text[page.start_char:next.end_char]`; `page_end` is set only when the
+   match actually crosses the break.
+3. **Ambiguity is rejected twice.** Both exact and regex matches must be unique;
+   a duplicate requires a longer disambiguating quote.
+4. **Models are frozen and declarative.** `str_strip_whitespace=True` plus
+   `min_length=1` rejects empty fields without mutating them inside a validator.
+5. **The smoke split is deterministic and stratified** (`seed=42`, round-robin
+   across 5 categories, so the default 15 is 3 per category) and degrades
+   gracefully when the dataset is smaller than the requested size.
+6. **`dataset stats` reads `golden_qa.jsonl` directly**, so coverage is visible
+   before any resolved JSON exists.
+7. **The UI is an optional extra.** `streamlit` is imported only inside
+   `annotator_app.main`, so CI and the core package never require it.
+8. **Golden QA stays human-authored.** Only the 5-item fixture exists; the
+   100–150 real items are written by the operator, not generated.
+
+### Verification evidence
+
+```
+$ python -m uv run ruff check src tests
+All checks passed!
+
+$ python -m uv run mypy src tests
+Success: no issues found in 31 source files
+
+$ python -m uv run pytest -q
+227 passed
+```
+
+Tests are fully offline: canonical documents are built in memory / `tmp_path`.
+
 ## Not done (deliberately)
 
-- No chunking, vector index, retrieval metrics, or golden QA yet.
-- No `source_url` values were invented; the manual corpus is pinned by SHA-256
-  instead. Document URLs can be added later if reproducible downloads are needed.
-- No live retrieval or eval has run yet.
+- No golden QA items were generated; only the schema fixture exists.
+- No chunking, vector index, retrieval metrics, or LLM-as-judge yet.
+- No `source_url` values were invented; the manual corpus is pinned by SHA-256.
 
 ## Next phase
 
-Sprint 2C should build chunking over `data/processed/docs/*.json` while
+Sprint 3B should build chunking over `data/processed/docs/*.json` while
 preserving `(doc_id, page_num, start_char, end_char)` provenance, then the
-retrieval layer. Metrics must not start until the golden QA schema exists.
+retrieval layer. Metrics must wait for the hand-written golden QA set.

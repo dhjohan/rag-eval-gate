@@ -20,6 +20,17 @@ from rag_eval.config import (
     load_providers_config,
     resolve_api_key,
 )
+from rag_eval.evals.dataset import CATEGORY_VALUES
+from rag_eval.evals.dataset_validator import (
+    DEFAULT_SMOKE_SIZE,
+    DatasetError,
+    coverage_problems,
+    dataset_statistics,
+    load_golden_qa,
+    validate_dataset,
+    write_resolved,
+    write_smoke,
+)
 from rag_eval.ingest.canonical_parser import (
     CanonicalParseError,
     parse_pdf,
@@ -61,6 +72,13 @@ corpus_app = typer.Typer(
     help="Corpus manifest: register local PDFs and fetch the rest.",
 )
 app.add_typer(corpus_app, name="corpus")
+
+dataset_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Golden QA dataset: validate citations and summarise coverage.",
+)
+app.add_typer(dataset_app, name="dataset")
 
 
 @app.command()
@@ -583,6 +601,139 @@ def corpus_stats(
             err=True,
         )
         raise typer.Exit(code=1)
+
+
+@dataset_app.command("validate")
+def dataset_validate(
+    input_path: Path = typer.Option(
+        Path("data/eval/golden_qa.jsonl"),
+        "--input",
+        "-i",
+        help="Path to golden_qa.jsonl.",
+    ),
+    docs_dir: Path = typer.Option(
+        Path("data/processed/docs"),
+        "--docs-dir",
+        help="Directory holding canonical parsed documents.",
+    ),
+    out: Path = typer.Option(
+        Path("data/eval/golden_qa.resolved.json"),
+        "--out",
+        "-o",
+        help="Resolved dataset output path (smoke split is written beside it).",
+    ),
+    smoke_size: int = typer.Option(
+        DEFAULT_SMOKE_SIZE, "--smoke-size", help="Number of stratified smoke items."
+    ),
+    strict: bool = typer.Option(
+        False,
+        "--strict/--no-strict",
+        help="Fail on any problem or coverage shortfall (CI mode).",
+    ),
+) -> None:
+    """Resolve citation offsets and write the resolved dataset + smoke split."""
+    if not input_path.is_file():
+        typer.secho(f"FAIL  dataset not found: {input_path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        result = validate_dataset(input_path, docs_dir, smoke_size=smoke_size)
+    except DatasetError as exc:
+        typer.secho(f"FAIL  {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+    resolved_path = write_resolved(out, result.resolved)
+    smoke_path = write_smoke(out.with_name("smoke_qa_ids.json"), result.smoke_ids)
+
+    if result.problems:
+        table = Table(title="dataset validate", header_style="bold")
+        table.add_column("line", justify="right", no_wrap=True)
+        table.add_column("qa_id", no_wrap=True)
+        table.add_column("problem", overflow="fold")
+        for problem in result.problems:
+            table.add_row(
+                str(problem.line_number),
+                problem.qa_id or "-",
+                Text(problem.message, style="red"),
+            )
+        Console().print(table)
+        typer.echo("")
+
+    stats = dataset_statistics(result.items)
+    category_summary = "  ".join(
+        f"{category}={stats.by_category.get(category, 0)}" for category in CATEGORY_VALUES
+    )
+    typer.echo(
+        f"lines {result.total_lines}  valid {len(result.items)}  "
+        f"resolved {len(result.resolved)}  problems {result.error_count}"
+    )
+    typer.echo(f"categories  {category_summary}")
+    typer.echo(f"resolved    {resolved_path}")
+    typer.echo(f"smoke       {smoke_path}  ({len(result.smoke_ids)} items)")
+
+    strict_problems = coverage_problems(result.items) if strict else []
+    for message in strict_problems:
+        typer.secho(f"FAIL  {message}", fg=typer.colors.RED, err=True)
+
+    if result.problems:
+        typer.secho(
+            f"WARN  {result.error_count} problem(s); resolved output contains only "
+            "valid items",
+            fg=typer.colors.YELLOW,
+        )
+
+    if strict and (result.problems or strict_problems):
+        raise typer.Exit(code=1)
+    if not result.items:
+        typer.secho("FAIL  no valid items in the dataset", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    typer.secho("OK    dataset validated", fg=typer.colors.GREEN)
+
+
+@dataset_app.command("stats")
+def dataset_stats(
+    input_path: Path = typer.Option(
+        Path("data/eval/golden_qa.jsonl"),
+        "--input",
+        "-i",
+        help="Path to golden_qa.jsonl (read directly; resolved JSON not required).",
+    ),
+) -> None:
+    """Summarise category, difficulty, doc coverage, and citation counts."""
+    if not input_path.is_file():
+        typer.secho(f"FAIL  dataset not found: {input_path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    loaded, problems = load_golden_qa(input_path)
+    stats = dataset_statistics([entry.item for entry in loaded])
+
+    category_table = Table(title="by category", header_style="bold")
+    category_table.add_column("category", no_wrap=True)
+    category_table.add_column("items", justify="right", no_wrap=True)
+    for category in CATEGORY_VALUES:
+        category_table.add_row(category, str(stats.by_category.get(category, 0)))
+    Console().print(category_table)
+
+    difficulty_table = Table(title="by difficulty", header_style="bold")
+    difficulty_table.add_column("difficulty", no_wrap=True)
+    difficulty_table.add_column("items", justify="right", no_wrap=True)
+    for difficulty in ("easy", "medium", "hard"):
+        difficulty_table.add_row(difficulty, str(stats.by_difficulty.get(difficulty, 0)))
+    Console().print(difficulty_table)
+
+    citations = "  ".join(
+        f"{count}c={items}" for count, items in stats.citation_counts.items()
+    )
+    typer.echo("")
+    typer.echo(
+        f"total {stats.total}  unanswerable {stats.unanswerable}  "
+        f"docs {len(stats.docs_covered)}  citations {citations or '-'}"
+    )
+    if problems:
+        typer.secho(
+            f"WARN  {len(problems)} line(s) could not be parsed (see `dataset validate`)",
+            fg=typer.colors.YELLOW,
+        )
 
 
 def _print_manifest(entries: list[ManifestEntry]) -> None:
