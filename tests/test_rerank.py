@@ -167,3 +167,125 @@ def test_5xx_exhausts_retries() -> None:
         reranker.rerank("q", ["a"])
 
     assert attempts == 3
+
+
+def test_top_n_negative_is_rejected() -> None:
+    reranker = make_reranker(
+        lambda request: httpx.Response(
+            200, json={"results": [{"index": 0, "relevance_score": 1.0}]}
+        )
+    )
+    with pytest.raises(RerankError, match="non-negative"):
+        reranker.rerank("q", ["a"], top_n=-1)
+
+
+def test_top_n_zero_returns_empty_without_request() -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={"results": []})
+
+    reranker = make_reranker(handler)
+    assert reranker.rerank("q", ["a"], top_n=0) == []
+    assert called is False
+
+
+def test_bool_index_and_score_are_rejected() -> None:
+    reranker = make_reranker(
+        lambda request: httpx.Response(
+            200, json={"results": [{"index": True, "relevance_score": False}]}
+        )
+    )
+    with pytest.raises(RerankError, match="valid index/score"):
+        reranker.rerank("q", ["a"])
+
+
+def test_nan_score_is_rejected() -> None:
+    reranker = make_reranker(
+        lambda request: httpx.Response(
+            200,
+            content=json.dumps(
+                {"results": [{"index": 0, "relevance_score": float("nan")}]},
+                allow_nan=True,
+            ),
+            headers={"content-type": "application/json"},
+        )
+    )
+    with pytest.raises(RerankError, match="valid index/score"):
+        reranker.rerank("q", ["a"])
+
+
+def test_inf_score_is_rejected() -> None:
+    reranker = make_reranker(
+        lambda request: httpx.Response(
+            200,
+            content=json.dumps(
+                {"results": [{"index": 0, "relevance_score": float("inf")}]},
+                allow_nan=True,
+            ),
+            headers={"content-type": "application/json"},
+        )
+    )
+    with pytest.raises(RerankError, match="valid index/score"):
+        reranker.rerank("q", ["a"])
+
+
+def test_connect_error_is_retried() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("connection reset")
+        return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 1.0}]})
+
+    reranker = make_reranker(handler)
+    hits = reranker.rerank("q", ["a"])
+
+    assert attempts == 2
+    assert hits[0].index == 0
+
+
+def test_disabled_reranker_is_rejected() -> None:
+    payload = {
+        "enabled": False,
+        "base_url": "https://api.jina.ai/v1",
+        "model": "jina-reranker-v3.5",
+        "api_key_env": "JINA_API_KEY",
+        "top_n": 10,
+    }
+    config = RerankConfig.model_validate(payload)
+    reranker = Reranker(config, api_key_resolver=lambda name: "secret")
+    with pytest.raises(RerankError, match="disabled"):
+        reranker.rerank("q", ["a"])
+
+
+def test_base_url_trailing_slash_is_stripped() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(
+            200, json={"results": [{"index": 0, "relevance_score": 1.0}]}
+        )
+
+    payload = {
+        "enabled": True,
+        "base_url": "https://api.jina.ai/v1/",  # trailing slash
+        "model": "jina-reranker-v3.5",
+        "api_key_env": "JINA_API_KEY",
+        "top_n": 10,
+    }
+    config = RerankConfig.model_validate(payload)
+    reranker = Reranker(
+        config,
+        api_key_resolver=lambda name: "secret",
+        transport=httpx.MockTransport(handler),
+    )
+    reranker.rerank("q", ["a"])
+
+    assert "//rerank" not in seen[0]
+    assert seen[0].endswith("/rerank")

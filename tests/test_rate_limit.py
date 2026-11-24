@@ -134,3 +134,81 @@ def test_limiter_denies_when_daily_quota_is_exhausted(cache: SqliteCache) -> Non
     denied = limiter.acquire()
     assert denied.allowed is False
     assert denied.reason == "daily_quota_exhausted"
+
+
+def test_bucket_does_not_double_credit_after_wait_on_advancing_clock() -> None:
+    # Simulate a real clock that keeps advancing during sleep. Without the fix,
+    # the second acquire would refill a full token immediately because _last was
+    # never advanced past the original time.
+    clock = FakeClock()
+    bucket = TokenBucket(60, capacity=1, clock=clock, sleep=clock.sleep)
+
+    # Drain the bucket; acquire sleeps 1.0s, advancing the clock to t=1.0.
+    assert bucket.acquire() == 0.0
+    assert bucket.acquire() == pytest.approx(1.0)
+    assert clock.now == pytest.approx(1.0)
+
+    # Immediately after the wait, the bucket should still be empty: the 1.0s of
+    # refill was already credited during the wait, not granted again on refill.
+    assert bucket.acquire() == pytest.approx(1.0)
+
+
+def test_bucket_guard_against_backward_clock() -> None:
+    calls: list[float] = []
+
+    def clock() -> float:
+        calls.append(calls[-1] if calls else 0.0)
+        return calls[-1]
+
+    def sleep(seconds: float) -> None:
+        calls.append(calls[-1] + seconds)
+
+    bucket = TokenBucket(60, capacity=1, clock=clock, sleep=sleep)
+    assert bucket.acquire() == 0.0
+    # Clock does not advance during sleep, so the bucket is empty again.
+    assert bucket.acquire() == pytest.approx(1.0)
+    # _last was advanced by the wait, so a non-advancing clock does not
+    # spuriously refill on the next call.
+    assert bucket.acquire() == pytest.approx(1.0)
+
+
+def test_compute_backoff_validates_cap_s() -> None:
+    with pytest.raises(ValueError, match="cap_s"):
+        compute_backoff(0, base_s=1.0, cap_s=0.0)
+    with pytest.raises(ValueError, match="cap_s"):
+        compute_backoff(0, base_s=1.0, cap_s=-5.0)
+
+
+def test_compute_backoff_does_not_overflow_for_large_attempt() -> None:
+    assert compute_backoff(1000, base_s=1.0, cap_s=30.0, jitter=0.0) == 30.0
+
+
+def test_parse_retry_after_rejects_non_finite(cache: SqliteCache) -> None:
+    assert parse_retry_after("inf") is None
+    assert parse_retry_after("-inf") is None
+    assert parse_retry_after("nan") is None
+
+
+def test_limiter_releases_quota_on_bucket_interrupt(cache: SqliteCache) -> None:
+    fixed = datetime(2026, 11, 23, 12, 0, tzinfo=UTC)
+    limiter = ProviderLimiter(
+        "p",
+        cache,
+        rpm=1,
+        rpd=2,
+        clock=FakeClock(),
+        sleep=lambda _: None,
+        now=lambda: fixed,
+    )
+    # Consume the quota and the single bucket token.
+    assert limiter.acquire().allowed is True
+
+    # Make the bucket raise during acquire; the quota slot must be returned.
+    def boom() -> float:
+        raise KeyboardInterrupt("interrupted")
+
+    limiter.bucket.acquire = boom  # type: ignore
+    with pytest.raises(KeyboardInterrupt):
+        limiter.acquire()
+
+    assert cache.get_quota_used("p", "2026-11-23") == 1

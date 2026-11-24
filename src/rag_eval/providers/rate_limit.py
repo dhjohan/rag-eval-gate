@@ -9,6 +9,7 @@ Free tiers fail in two different ways, so they are modelled separately:
 
 from __future__ import annotations
 
+import math
 import random
 import threading
 import time
@@ -59,7 +60,11 @@ class TokenBucket:
 
     def _refill_locked(self) -> None:
         now = self._clock()
-        elapsed = max(0.0, now - self._last)
+        if now <= self._last:
+            # Time already accounted for (e.g. explicitly credited during a
+            # previous wait); avoid double-crediting on a real or advancing clock.
+            return
+        elapsed = now - self._last
         self._tokens = min(self.capacity, self._tokens + elapsed * self.rate_per_second)
         self._last = now
 
@@ -76,12 +81,13 @@ class TokenBucket:
                 return 0.0
             deficit = tokens - self._tokens
             wait_s = deficit / self.rate_per_second
-            self._sleep(wait_s)
-            # Credit the wait explicitly instead of re-reading the clock: a fake
-            # clock in tests is not required to advance during sleep.
+            # Credit the wait explicitly and advance ``_last`` so the elapsed
+            # time during ``sleep`` is not double-counted on the next refill.
             self._tokens = min(self.capacity, self._tokens + wait_s * self.rate_per_second)
             self._tokens -= tokens
-            return wait_s
+            self._last = max(self._clock(), self._last + wait_s)
+        self._sleep(wait_s)
+        return wait_s
 
 
 class DailyQuota:
@@ -142,7 +148,14 @@ class ProviderLimiter:
     def acquire(self) -> AcquireOutcome:
         if not self.quota.try_consume():
             return AcquireOutcome(allowed=False, reason="daily_quota_exhausted")
-        waited = self.bucket.acquire() if self.bucket is not None else 0.0
+        try:
+            waited = self.bucket.acquire() if self.bucket is not None else 0.0
+        except BaseException:
+            # The quota slot was consumed but the bucket never used it (e.g.
+            # interrupted during sleep); return it so the next caller isn't
+            # short-changed.
+            self.quota.release()
+            raise
         return AcquireOutcome(allowed=True, waited_s=waited)
 
     def release(self) -> None:
@@ -166,9 +179,12 @@ def compute_backoff(
         raise ValueError("attempt must be >= 0")
     if base_s <= 0:
         raise ValueError("base_s must be positive")
+    if cap_s <= 0:
+        raise ValueError("cap_s must be positive")
     if not 0.0 <= jitter <= 1.0:
         raise ValueError("jitter must be within [0, 1]")
-    raw = min(cap_s, base_s * (2**attempt))
+    # Guard against overflow for very large attempt values.
+    raw = cap_s if attempt >= 60 else min(cap_s, base_s * (2.0**attempt))
     if jitter == 0.0:
         return raw
     low = raw * (1.0 - jitter)
@@ -188,11 +204,13 @@ def parse_retry_after(value: str | None) -> float | None:
     except ValueError:
         try:
             when = parsedate_to_datetime(cleaned)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, IndexError):
             return None
         if when is None:
             return None
         if when.tzinfo is None:
             when = when.replace(tzinfo=UTC)
         seconds = (when - datetime.now(UTC)).total_seconds()
+    if not math.isfinite(seconds):
+        return None
     return max(0.0, seconds)

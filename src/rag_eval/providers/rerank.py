@@ -6,6 +6,7 @@ return ``(index, score)`` pairs that preserve the caller's document order.
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from collections.abc import Callable, Sequence
@@ -82,11 +83,18 @@ class Reranker:
         api_key = self._resolve_key(self._config.api_key_env)
         if not api_key:
             raise RerankError(f"missing API key: {self._config.api_key_env}")
+        if not self._config.enabled:
+            raise RerankError("reranking is disabled")
         if not self._config.is_configured:
             missing = ", ".join(self._config.unresolved_env)
             raise RerankError(f"unresolved environment variables: {missing}")
 
-        limit = min(top_n if top_n is not None else self._config.top_n, len(documents))
+        effective_top_n = top_n if top_n is not None else self._config.top_n
+        if effective_top_n < 0:
+            raise RerankError(f"top_n must be non-negative, got {effective_top_n}")
+        if effective_top_n == 0:
+            return []
+        limit = min(effective_top_n, len(documents))
         payload: dict[str, Any] = {
             "model": self._config.model,
             "query": query,
@@ -111,8 +119,14 @@ class Reranker:
                 raise RerankError("rerank result entry was not an object")
             index = item.get("index")
             score = item.get("relevance_score", item.get("score"))
-            if not isinstance(index, int) or not isinstance(score, int | float):
-                raise RerankError("rerank result entry was missing index/score")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or isinstance(score, bool)
+                or not isinstance(score, int | float)
+                or not math.isfinite(score)
+            ):
+                raise RerankError("rerank result entry was missing valid index/score")
             if not 0 <= index < len(documents):
                 raise RerankError(f"rerank returned out-of-range index {index}")
             hits.append(RerankHit(index=index, score=float(score)))
@@ -121,11 +135,11 @@ class Reranker:
         return hits[:limit]
 
     def _post_with_retries(self, payload: dict[str, Any], api_key: str) -> httpx.Response:
-        """POST once, retrying transient statuses and timeouts with backoff."""
+        """POST once, retrying transient statuses and transport errors with backoff."""
         for attempt in range(self._max_retries + 1):
             try:
                 response = self._client.post(
-                    f"{self._config.base_url}/rerank",
+                    f"{self._config.base_url.rstrip('/')}/rerank",
                     json=payload,
                     headers={
                         "Authorization": f"Bearer {api_key}",
@@ -134,12 +148,10 @@ class Reranker:
                     },
                     timeout=self._config.timeout_s,
                 )
-            except httpx.TimeoutException as exc:
+            except httpx.TransportError as exc:
                 if attempt < self._max_retries:
                     self._sleep(self._backoff(attempt))
                     continue
-                raise RerankError(f"rerank transport error: {exc}") from exc
-            except httpx.HTTPError as exc:
                 raise RerankError(f"rerank transport error: {exc}") from exc
 
             status = response.status_code
