@@ -36,4 +36,111 @@
 #     local_filename: fda-example-guidance.pdf
 #     expected_sha256: null
 schema_version: 1
-documents: []
+documents:
+- doc_id: 10555fnlpraupdate11-21-22
+  title: 10555fnlPRAupdate11 21 22
+  category: fda_digital_health
+  local_filename: 10555fnlPRAupdate11-21-22.pdf
+  expected_sha256: 76556b1dcf148a1929f110bb1bfdf17d554630b665d23ad2b885473c5e8f2561
+- doc_id: 57746937-fnl
+  title: 57746937 fnl
+  category: fda_digital_health
+  local_filename: 57746937-fnl.pdf
+  expected_sha256: b757ad57d2216bf2fa8931bfe0546cf38364f5342a8c65ac89513275f8bcf68d
+- doc_id: 58358119fnl
+  title: 58358119fnl
+  category: fda_digital_health
+  local_filename: 58358119fnl.pdf
+  expected_sha256: f74ce1b061edfa634aaf0a0b07a472995a6d215f310a562e17ae46c0b67b47a6
+- doc_id: cade-clinical-perf-guidance
+  title: CADe Clinical Perf Guidance
+  category: fda_digital_health
+  local_filename: CADe-Clinical-Perf-Guidance.pdf
+  expected_sha256: a24ffc203940f1203a6bbb10e1894ed2a006095baa38780eed269c900de78abe
+- doc_id: digital-health-technologies-for-remote-data-acquisition-in-clinical-investigatio
+  title: Digital Health Technologies for Remote Data Acquisition in Clinical Investigations
+  category: fda_digital_health
+  local_filename: Digital Health Technologies for Remote Data Acquisition in Clinical Investigations.pdf
+  expected_sha256: 8beb76ed0d20be27958d1aaaf274485a2b7443b69c173d0f5cdc27f35874a174
+- doc_id: electronic-source-data-in-clinical-investigations
+  title: Electronic Source Data in Clinical Investigations
+  category: fda_digital_health
+  local_filename: Electronic-Source-Data-in-Clinical-Investigations.pdf
+  expected_sha256: 9d8c2151c81996cc363fb0948608b3461008b14fd154339954d6c876caecc7e8
+- doc_id: general-principles-of-software-validation-final-guidance-for-industry-and-fda-st
+  title: General Principles of Software Validation Final Guidance for Industry and FDA Staff 0
+  category: fda_digital_health
+  local_filename: General-Principles-of-Software-Validation---Final-Guidance-for-Industry-and-FDA-Staff_0.pdf
+  expected_sha256: eae6bc54bdc03fe470c29ef08ecfb4621ac3fb63042f7457b148efd03e003418
+- doc_id: general-wellness-policy-low-risk-devices-guidance-1
+  title: general wellness policy low risk devices guidance (1)
+  category: fda_digital_health
+  local_filename: general-wellness-policy-low-risk-devices-guidance (1).pdf
+  expected_sha256: 0756013b2a64bfdc23902afad6195edc4e20d2570308845c2138c4b5c8dd2b7e
+- doc_id: guidance-ai-enabled-device-software-functions
+  title: Guidance ai enabled device software functions
+  category: fda_digital_health
+  local_filename: Guidance-ai-enabled-device-software-functions.pdf
+  expected_sha256: 62e83e0f4cbd36aed96f2f98ced597f3146f25ae66abba9849325e4e4b7520bc
+- doc_id: guidance-clinical-decision-software-5
+  title: Guidance Clinical Decision Software 5
+  category: fda_digital_health
+  local_filename: Guidance-Clinical-Decision-Software_5.pdf
+  expected_sha256: 156bdc583aa71b6997ba327d8d97ade09fd1f76c5999a1214cdbe7c3e03d1eef
+- doc_id: guidance-computer-software-assurance-production-quality-system
+  title: guidance computer software assurance production quality system
+  category: fda_digital_health
+  local_filename: guidance-computer-software-assurance-production-quality-system.pdf
+  expected_sha256: 11e2e21f5eb226b56a578da44e732965a2318e9b983422c6a58e51bc7b2e223a
+- doc_id: guidance-device-mdds
+  title: Guidance Device MDDS
+  category: fda_digital_health
+  local_filename: Guidance-Device-MDDS.pdf
+  expected_sha256: 4ae24376bf518251460c7b57e63fdd85046abbb9ee6a3e7903155e163433f017
+- doc_id: guidance-devices-3060-0
+  title: Guidance Devices 3060 0
+  category: fda_digital_health
+  local_filename: Guidance-Devices-3060_0.pdf
+  expected_sha256: ea61794cf99b6a9dae5c675c0c9a1c0f51ce11233948ce32f39c2ec4cd3fcf54
+- doc_id: guidance-dsf-mma
+  title: Guidance DSF MMA
+  category: fda_digital_health
+  local_filename: Guidance-DSF-MMA.pdf
+  expected_sha256: 7fb21371f814ec843c208e2b98e3505a7f4f47aa845040a419af4929e95d053e
+- doc_id: guidance-medical-device-accessories-describing-accessories-and-classification-pa
+  title: Guidance Medical Device Accessories Describing Accessories and Classification Pathways (1)
+  category: fda_digital_health
+  local_filename: Guidance-Medical-Device-Accessories-Describing-Accessories-and-Classification-Pathways
+    (1).pdf
+  expected_sha256: ba4ce9b4fe8638d8aa6a74e683e2fa329c02e90be98890544bf6d1289fd941c0
+- doc_id: guidance-predetermined-change-control-ai
+  title: Guidance Predetermined Change Control AI
+  category: fda_digital_health
+  local_filename: Guidance-Predetermined-Change-Control-AI.pdf
+  expected_sha256: 80f0f423efe0c8104460a9064615a2093e9a620deae013db670792c7f599e4d9
+- doc_id: informed-consent-guidance-for-institutional-review-boards-clinical-investigators
+  title: Informed Consent Guidance for Institutional Review Boards Clinical Investigators and Sponsors
+  category: fda_digital_health
+  local_filename: Informed Consent Guidance for Institutional Review Boards Clinical Investigators and
+    Sponsors.pdf
+  expected_sha256: 96b26b2edb06e20ee2872ca59f4ec7c04cde8a8b1adf98bc150764e3d52f906a
+- doc_id: multiple-function-device-products-guidance-3
+  title: Multiple Function Device Products Guidance 3
+  category: fda_digital_health
+  local_filename: Multiple-Function-Device-Products-Guidance_3.pdf
+  expected_sha256: 13adc11aff7c259311fe965c5d7afcb98c764ce7cd0904a7e3fd288bdadd5702
+- doc_id: off-the-shelf-guidance-0
+  title: Off The Shelf Guidance 0
+  category: fda_digital_health
+  local_filename: Off-The-Shelf-Guidance_0.pdf
+  expected_sha256: d73d361143cb06234c860b2f025367839304524780681c7d0722d25624aadbf2
+- doc_id: premarket-cybersecurity-guidance-2026
+  title: Premarket Cybersecurity Guidance 2026
+  category: fda_digital_health
+  local_filename: Premarket-Cybersecurity-Guidance-2026.pdf
+  expected_sha256: d046fa836048933e1a8795bcf2f8224bcfa08789c2f3ef6f46ae53c2eb096c54
+- doc_id: premarket-software-functions-guidance
+  title: Premarket Software Functions Guidance
+  category: fda_digital_health
+  local_filename: Premarket-Software-Functions-Guidance.pdf
+  expected_sha256: dee0c15e11499682ca281120a9828180ec16710eea3d9e272cee5807050a704a
