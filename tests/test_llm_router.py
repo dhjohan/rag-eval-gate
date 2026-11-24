@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from rag_eval.cache.sqlite_cache import SqliteCache
 from rag_eval.config import LLMConfig
-from rag_eval.providers.llm import AllProvidersFailed, LLMRouter
+from rag_eval.providers.llm import AllProvidersFailed, LLMRouter, _strict_json_schema
 
 
 class Verdict(BaseModel):
@@ -601,23 +601,30 @@ def test_retry_after_http_date_is_honoured(
     assert 3.0 <= sleeps[0] <= 6.0
 
 
-def test_retry_after_is_clamped_to_backoff_cap(
+def test_retry_after_above_cap_fails_over_immediately(
     provider: Callable[..., dict[str, Any]],
     llm_config: Callable[..., LLMConfig],
     cache: SqliteCache,
 ) -> None:
     sleeps: list[float] = []
-    config = llm_config({"a": provider()}, backoff_cap_s=5.0)
+    providers = {
+        "a": provider(base_url="https://a.test/v1"),
+        "b": provider(base_url="https://b.test/v1"),
+    }
+    config = llm_config(providers, order=["a", "b"], backoff_cap_s=5.0)
 
     def handler(request: httpx.Request, n: int) -> httpx.Response:
-        if n == 1:
+        if "a.test" in str(request.url):
             return httpx.Response(429, headers={"retry-after": "100"})
-        return httpx.Response(200, json=ok_body())
+        return httpx.Response(200, json=ok_body(model="b-model"))
 
-    router, _calls = make_router(config, cache, handler, sleep=sleeps.append)
-    router.generate([{"role": "user", "content": "hi"}])
+    router, calls = make_router(config, cache, handler, sleep=sleeps.append)
+    result = router.generate([{"role": "user", "content": "hi"}])
 
-    assert sleeps == [5.0]
+    # Waiting out a 100s cooldown is pointless; fail over to b right away.
+    assert result.provider_used == "b"
+    assert sleeps == []
+    assert sum(1 for call in calls if "a.test" in str(call.url)) == 1
 
 
 def test_prompt_hash_includes_effective_provider_defaults(
@@ -688,3 +695,239 @@ def test_strict_schema_closes_every_object(
     nested = schema["$defs"]["_Detail"]
     assert nested["additionalProperties"] is False
     assert nested["required"] == ["note"]
+
+
+def test_think_block_json_is_not_mistaken_for_the_answer(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    config = llm_config({"a": provider()})
+    content = (
+        '<think>I first considered {"score": 0, "reason": "draft"} but that is wrong</think>'
+        '{"score": 9, "reason": "final"}'
+    )
+    router, _calls = make_router(
+        config, cache, lambda req, n: httpx.Response(200, json=ok_body(content=content))
+    )
+
+    result = router.generate([{"role": "user", "content": "judge"}], response_model=Verdict)
+
+    assert isinstance(result.parsed, Verdict)
+    assert result.parsed.score == 9
+
+
+def test_stray_closing_think_tag_is_stripped(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    config = llm_config({"a": provider()})
+    content = 'reasoning without an opening tag</think>{"score": 5, "reason": "ok"}'
+    router, _calls = make_router(
+        config, cache, lambda req, n: httpx.Response(200, json=ok_body(content=content))
+    )
+
+    result = router.generate([{"role": "user", "content": "judge"}], response_model=Verdict)
+
+    assert isinstance(result.parsed, Verdict)
+    assert result.parsed.score == 5
+
+
+def test_corrupt_cache_entry_does_not_hide_a_valid_one(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    providers = {
+        "a": provider(base_url="https://a.test/v1", model="model-A"),
+        "b": provider(base_url="https://b.test/v1", model="model-B"),
+    }
+    config = llm_config(providers, order=["a", "b"])
+    messages = [{"role": "user", "content": "judge"}]
+
+    def handler(request: httpx.Request, n: int) -> httpx.Response:
+        raise AssertionError("a valid cache entry must be served without network")
+
+    router, _calls = make_router(config, cache, handler)
+    hash_a = router._prompt_hash(
+        messages, Verdict, None, None, None, config.providers["a"]
+    )
+    cache.put_llm_response(
+        hash_a,
+        "Verdict",
+        content="not json at all",
+        provider_used="a",
+        requested_model="model-A",
+        model_used="model-A",
+        usage_tokens=1,
+        latency_ms=1,
+    )
+    hash_b = router._prompt_hash(
+        messages, Verdict, None, None, None, config.providers["b"]
+    )
+    cache.put_llm_response(
+        hash_b,
+        "Verdict",
+        content='{"score": 6, "reason": "cached"}',
+        provider_used="b",
+        requested_model="model-B",
+        model_used="model-B",
+        usage_tokens=2,
+        latency_ms=2,
+    )
+
+    result = router.generate(messages, response_model=Verdict)
+
+    assert result.cache_hit is True
+    assert result.provider_used == "b"
+    assert isinstance(result.parsed, Verdict)
+    assert result.parsed.score == 6
+
+
+def test_multipart_content_skips_non_string_parts(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    config = llm_config({"a": provider()})
+    payload = ok_body()
+    payload["choices"][0]["message"]["content"] = [
+        {"type": "text", "text": None},
+        {"type": "text", "text": "hello "},
+        {"type": "text", "text": "world"},
+    ]
+    router, _calls = make_router(
+        config, cache, lambda req, n: httpx.Response(200, json=payload)
+    )
+
+    assert router.generate([{"role": "user", "content": "hi"}]).content == "hello world"
+
+
+@pytest.mark.parametrize("usage", [[], "n/a", 5])
+def test_non_object_usage_does_not_crash(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+    usage: Any,
+) -> None:
+    config = llm_config({"a": provider()})
+    body = ok_body()
+    body["usage"] = usage
+    router, _calls = make_router(
+        config, cache, lambda req, n: httpx.Response(200, json=body)
+    )
+
+    assert router.generate([{"role": "user", "content": "hi"}]).usage_tokens == 0
+
+
+def test_schema_instruction_merges_into_existing_system_message(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    config = llm_config({"a": provider(structured_output="none")})
+    payload = ok_body(content='{"score": 2, "reason": "ok"}')
+    router, calls = make_router(
+        config, cache, lambda req, n: httpx.Response(200, json=payload)
+    )
+
+    router.generate(
+        [
+            {"role": "system", "content": "You are a strict judge."},
+            {"role": "user", "content": "judge"},
+        ],
+        response_model=Verdict,
+    )
+
+    messages = json.loads(calls[0].content)["messages"]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "You are a strict judge." in messages[0]["content"]
+    assert "JSON Schema" in messages[0]["content"]
+
+
+def test_redirect_fails_over_to_next_provider(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    providers = {
+        "a": provider(base_url="https://a.test/v1"),
+        "b": provider(base_url="https://b.test/v1"),
+    }
+    config = llm_config(providers, order=["a", "b"])
+
+    def handler(request: httpx.Request, n: int) -> httpx.Response:
+        if "a.test" in str(request.url):
+            return httpx.Response(302, headers={"location": "https://elsewhere.test/"})
+        return httpx.Response(200, json=ok_body())
+
+    router, calls = make_router(config, cache, handler)
+    result = router.generate([{"role": "user", "content": "hi"}])
+
+    assert result.provider_used == "b"
+    assert sum(1 for call in calls if "a.test" in str(call.url)) == 1
+
+
+def test_prompt_hash_includes_structured_output_mode(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    messages = [{"role": "user", "content": "judge"}]
+    content = '{"score": 1, "reason": "ok"}'
+    router_none, _calls_none = make_router(
+        llm_config({"a": provider(structured_output="none")}),
+        cache,
+        lambda req, n: httpx.Response(200, json=ok_body(content=content)),
+    )
+    router_schema, calls_schema = make_router(
+        llm_config({"a": provider(structured_output="json_schema")}),
+        cache,
+        lambda req, n: httpx.Response(200, json=ok_body(content=content)),
+    )
+
+    router_none.generate(messages, response_model=Verdict)
+    second = router_schema.generate(messages, response_model=Verdict)
+
+    # Same model, different structured-output mode: must not replay the old
+    # cached answer.
+    assert second.cache_hit is False
+    assert len(calls_schema) == 1
+
+
+def test_code_fence_with_nonstandard_language_tag_is_parsed(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    config = llm_config({"a": provider()})
+    fenced = '```json5\n{"score": 8, "reason": "fenced"}\n```'
+    router, _calls = make_router(
+        config, cache, lambda req, n: httpx.Response(200, json=ok_body(content=fenced))
+    )
+
+    result = router.generate([{"role": "user", "content": "judge"}], response_model=Verdict)
+
+    assert isinstance(result.parsed, Verdict)
+    assert result.parsed.score == 8
+
+
+def test_strict_schema_leaves_defaults_and_map_values_untouched() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "nested": {"type": "object", "default": {"type": "object"}},
+            "mapping": {"type": "object", "additionalProperties": {"type": "string"}},
+        },
+    }
+
+    normalised = _strict_json_schema(schema)
+
+    # `default` is data, not a schema, so it must not be rewritten.
+    assert "additionalProperties" not in normalised["properties"]["nested"]["default"]
+    # A schema-valued additionalProperties (free-form map) is preserved.
+    assert normalised["properties"]["mapping"]["additionalProperties"] == {
+        "type": "string"
+    }
+    assert normalised["additionalProperties"] is False

@@ -146,51 +146,52 @@ class LLMRouter:
             self._config.prompt_cache_enabled if use_cache is None else use_cache
         )
         target = response_model.__name__ if response_model is not None else "freeform"
+        candidates = self._candidate_order(response_model)
+        prompt_hashes = {
+            name: self._prompt_hash(
+                messages,
+                response_model,
+                temperature,
+                max_tokens,
+                reasoning_effort,
+                self._config.providers[name],
+            )
+            for name in candidates
+        }
 
         if cache_enabled:
             # A cached answer is only valid for the provider/model that produced
             # it, so probe each candidate provider's cache entry before going
-            # to the network. The first hit wins.
-            cached = None
-            for name in self._candidate_order(response_model):
+            # to the network. A corrupt entry is skipped, not fatal: another
+            # provider may still have a valid answer.
+            for name in candidates:
                 cfg = self._config.providers[name]
-                prompt_hash = self._prompt_hash(
-                    messages,
-                    response_model,
-                    temperature,
-                    max_tokens,
-                    reasoning_effort,
-                    cfg,
-                )
                 candidate = self._cache.get_llm_response(
-                    prompt_hash,
+                    prompt_hashes[name],
                     target,
                     provider_used=name,
                     requested_model=cfg.model,
                 )
-                if candidate is not None:
-                    cached = candidate
-                    break
-            if cached is not None:
+                if candidate is None:
+                    continue
                 parsed = None
                 if response_model is not None:
                     try:
-                        parsed = _parse_structured(cached.content, response_model)
+                        parsed = _parse_structured(candidate.content, response_model)
                     except LLMError:
-                        cached = None
-                if cached is not None:
-                    return LLMResult(
-                        content=cached.content,
-                        usage_tokens=cached.usage_tokens,
-                        latency_ms=cached.latency_ms,
-                        provider_used=cached.provider_used,
-                        model_used=cached.model_used,
-                        cache_hit=True,
-                        parsed=parsed,
-                    )
+                        continue
+                return LLMResult(
+                    content=candidate.content,
+                    usage_tokens=candidate.usage_tokens,
+                    latency_ms=candidate.latency_ms,
+                    provider_used=candidate.provider_used,
+                    model_used=candidate.model_used,
+                    cache_hit=True,
+                    parsed=parsed,
+                )
 
         failures: list[ProviderFailure] = []
-        for name in self._candidate_order(response_model):
+        for name in candidates:
             cfg = self._config.providers[name]
             if not cfg.is_configured:
                 missing = ", ".join(cfg.unresolved_env)
@@ -201,14 +202,6 @@ class LLMRouter:
                 failures.append(ProviderFailure(name, f"missing_api_key:{cfg.api_key_env}"))
                 continue
 
-            prompt_hash = self._prompt_hash(
-                messages,
-                response_model,
-                temperature,
-                max_tokens,
-                reasoning_effort,
-                cfg,
-            )
             result = self._try_provider(
                 name,
                 cfg,
@@ -224,7 +217,7 @@ class LLMRouter:
                 continue
             if cache_enabled:
                 self._cache.put_llm_response(
-                    prompt_hash,
+                    prompt_hashes[name],
                     target,
                     content=result.content,
                     provider_used=result.provider_used,
@@ -267,13 +260,18 @@ class LLMRouter:
         configured ``max_tokens`` or ``reasoning_effort`` changes.
         """
         effective_max_tokens = max_tokens if max_tokens is not None else cfg.max_tokens
-        effective_effort = reasoning_effort or cfg.reasoning_effort
+        effective_effort = (
+            reasoning_effort if reasoning_effort is not None else cfg.reasoning_effort
+        )
         return sha256_text(
             canonical_json(
                 {
                     "messages": [dict(message) for message in messages],
                     "schema": (
                         response_model.model_json_schema() if response_model is not None else None
+                    ),
+                    "structured_output": (
+                        cfg.structured_output if response_model is not None else None
                     ),
                     "temperature": temperature,
                     "max_tokens": effective_max_tokens,
@@ -296,7 +294,7 @@ class LLMRouter:
         failures: list[ProviderFailure],
     ) -> LLMResult | None:
         limiter = self._limiters[name]
-        url = f"{cfg.base_url}/chat/completions"
+        url = f"{cfg.base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -318,7 +316,7 @@ class LLMRouter:
                 failures.append(ProviderFailure(name, outcome.reason or "throttled"))
                 return None
 
-            started = time.perf_counter()
+            started = self._clock()
             try:
                 response = self._client.post(
                     url, json=payload, headers=headers, timeout=cfg.timeout_s
@@ -334,7 +332,7 @@ class LLMRouter:
                     ProviderFailure(name, f"transport_error:{type(exc).__name__}", None)
                 )
                 return None
-            latency_ms = int((time.perf_counter() - started) * 1000)
+            latency_ms = int((self._clock() - started) * 1000)
             status = response.status_code
 
             if status == 429:
@@ -342,10 +340,19 @@ class LLMRouter:
                 # before retrying; otherwise one throttled call would burn the
                 # daily budget once per attempt.
                 limiter.release()
+                retry_after = parse_retry_after(response.headers.get("retry-after"))
+                if retry_after is not None and retry_after > self._config.backoff_cap_s:
+                    # Waiting out a long provider-imposed cooldown is worse than
+                    # failing over to the next provider now.
+                    failures.append(
+                        ProviderFailure(
+                            name, f"http_429:retry_after_{retry_after:.0f}s", status
+                        )
+                    )
+                    return None
                 if attempt < self._config.max_retries:
-                    retry_after = parse_retry_after(response.headers.get("retry-after"))
                     delay = retry_after if retry_after is not None else self._backoff(attempt)
-                    self._sleep(min(delay, self._config.backoff_cap_s))
+                    self._sleep(max(0.0, min(delay, self._config.backoff_cap_s)))
                     continue
                 failures.append(ProviderFailure(name, "http_429", status))
                 return None
@@ -361,6 +368,12 @@ class LLMRouter:
                 # Provider rejected before processing; return the quota slot.
                 limiter.release()
                 failures.append(ProviderFailure(name, "auth_rejected", status))
+                return None
+
+            if 300 <= status < 400:
+                # The client does not follow redirects, and a redirect body is
+                # not a completion; treat it as a provider-level failure.
+                failures.append(ProviderFailure(name, f"http_{status}:redirect", status))
                 return None
 
             if status >= 400:
@@ -388,7 +401,9 @@ class LLMRouter:
                     )
                     return None
 
-            usage = body.get("usage") or {}
+            usage = body.get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
             tokens = usage.get("total_tokens")
             if not isinstance(tokens, int):
                 tokens = int(usage.get("prompt_tokens") or 0) + int(
@@ -430,11 +445,21 @@ class LLMRouter:
     ) -> dict[str, Any]:
         outgoing = [dict(message) for message in messages]
         if response_model is not None and cfg.structured_output != "json_schema":
-            # Providers without native schema enforcement still get the contract.
-            outgoing = [
-                {"role": "system", "content": _schema_instruction(response_model)},
-                *outgoing,
-            ]
+            # Providers without native schema enforcement still get the
+            # contract. Merge into an existing leading system message so chat
+            # templates do not see two consecutive system turns.
+            instruction = _schema_instruction(response_model)
+            merged = False
+            if outgoing and outgoing[0].get("role") == "system":
+                existing = outgoing[0].get("content")
+                if isinstance(existing, str):
+                    outgoing[0] = {
+                        **outgoing[0],
+                        "content": f"{instruction}\n\n{existing}",
+                    }
+                    merged = True
+            if not merged:
+                outgoing.insert(0, {"role": "system", "content": instruction})
 
         payload: dict[str, Any] = {
             "model": cfg.model,
@@ -446,7 +471,7 @@ class LLMRouter:
         effective_max_tokens = max_tokens if max_tokens is not None else cfg.max_tokens
         if effective_max_tokens is not None:
             payload["max_tokens"] = effective_max_tokens
-        effort = reasoning_effort or cfg.reasoning_effort
+        effort = reasoning_effort if reasoning_effort is not None else cfg.reasoning_effort
         if effort is not None:
             payload["reasoning_effort"] = effort
 
@@ -476,6 +501,10 @@ def _schema_instruction(response_model: type[BaseModel]) -> str:
     )
 
 
+# Keys whose values are data (defaults, examples, enums), not subschemas.
+_SCHEMA_METADATA_KEYS = frozenset({"default", "examples", "const", "enum"})
+
+
 def _strict_json_schema(schema: Any) -> Any:
     """Close every object and require every property for strict schema mode.
 
@@ -483,11 +512,22 @@ def _strict_json_schema(schema: Any) -> Any:
     ``additionalProperties: false`` or where a property is absent from
     ``required``. Pydantic only emits the former for ``extra="forbid"`` models
     and leaves optional fields out of ``required``.
+
+    Values under ``default``/``examples``/``const``/``enum`` are data, not
+    schemas, so they are copied verbatim. A schema-valued
+    ``additionalProperties`` (a free-form map field) is left intact because
+    strict mode does not support it.
     """
     if isinstance(schema, dict):
-        normalised = {key: _strict_json_schema(value) for key, value in schema.items()}
+        normalised = {
+            key: (
+                value if key in _SCHEMA_METADATA_KEYS else _strict_json_schema(value)
+            )
+            for key, value in schema.items()
+        }
         if normalised.get("type") == "object":
-            normalised["additionalProperties"] = False
+            if not isinstance(normalised.get("additionalProperties"), dict):
+                normalised["additionalProperties"] = False
             properties = normalised.get("properties")
             if isinstance(properties, dict):
                 normalised["required"] = list(properties)
@@ -509,7 +549,9 @@ def _extract_content(body: Any) -> str:
     content = message.get("content")
     if isinstance(content, list):
         content = "".join(
-            part.get("text", "") for part in content if isinstance(part, dict)
+            part["text"]
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
     if not isinstance(content, str) or not content.strip():
         raise LLMError("response contained empty content")
@@ -521,17 +563,33 @@ def _parse_structured(text: str, response_model: type[BaseModel]) -> BaseModel:
     # Reasoning models (e.g. Nemotron Ultra) wrap answers in
     # <think>...</think> blocks; strip them before JSON parsing.
     cleaned = re.sub(
-        r" thinking.*?</think>",
+        r"<think>.*?</think>",
         "",
         cleaned,
         flags=re.DOTALL | re.IGNORECASE,
+    )
+    # Some models omit the opening tag and only emit a closing one; drop the
+    # reasoning prefix in that case.
+    cleaned = re.sub(
+        r"^.*?</think>",
+        "",
+        cleaned,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE,
     ).strip()
-    if cleaned.startswith("```"):
+
+    fence = re.search(
+        r"```(?:[A-Za-z0-9_-]+)?\s*(.*?)\s*```",
+        cleaned,
+        flags=re.DOTALL,
+    )
+    if fence is not None:
+        cleaned = fence.group(1).strip()
+    elif cleaned.startswith("```"):
+        # Unclosed fence: drop the opening marker and an optional language tag.
         cleaned = cleaned[3:]
         if cleaned[:4].lower() == "json":
             cleaned = cleaned[4:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
         cleaned = cleaned.strip()
 
     try:
@@ -555,7 +613,7 @@ def _parse_structured(text: str, response_model: type[BaseModel]) -> BaseModel:
 
 def _error_snippet(response: httpx.Response) -> str:
     try:
-        text = response.text
+        text = response.text[:1000]
     except Exception:  # pragma: no cover - defensive
         return "unreadable"
     return " ".join(text.split())[:200]
