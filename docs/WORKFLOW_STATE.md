@@ -275,13 +275,28 @@ Banned-dependency check unchanged: no `torch`, `onnxruntime`, `transformers`,
 `sentence-transformers`, `spacy`, `docling`, `marker`, `easyocr`, `ollama`,
 `ragas`, or `deepeval`.
 
+## Corpus populated (Step 4, 2026-11-24)
+
+Twenty-two PDFs were downloaded manually into `data/raw/`. `rag-eval corpus scan-local`
+registered them as **21 unique documents** (one byte-identical duplicate was skipped
+by SHA-256), and `rag-eval corpus download` verified every file:
+
+```
+total 21  ok 21  failed 0
+OK    corpus is ready
+```
+
+`data/raw/manifest.json` reports 21 documents, all `local_verified`, each with a
+pinned SHA-256 and byte count. The entries have `local_filename` but no
+`source_url` (the files were fetched by hand), so the corpus is local state and
+`data/raw/` remains git-ignored.
+
 ## Not done (deliberately)
 
-- No live download was executed inside the agent loop; the corpus is still empty.
 - No PDF parsing, text extraction, chunking, index building, or metrics.
-- `configs/corpus.yaml` ships with zero documents. The 20-25 real FDA documents
-  must be added by a human with verified `source_url` values (or dropped into
-  `data/raw/` and registered with `scan-local`); no URL was guessed.
+- No `source_url` values were invented; the manual corpus is pinned by SHA-256
+  instead. Document URLs can be added later if reproducible downloads are needed.
+- No live retrieval or eval has run yet.
 
 ## Next phase
 

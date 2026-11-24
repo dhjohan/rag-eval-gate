@@ -742,10 +742,11 @@ def test_verify_pdf_file_rejects_small_and_non_pdf(tmp_path: Path) -> None:
         verify_pdf_file(html)
 
 
-def test_shipped_corpus_config_matches_canonical_render() -> None:
+def test_shipped_corpus_config_is_in_canonical_form() -> None:
     shipped = Path(__file__).resolve().parents[1] / "configs" / "corpus.yaml"
     normalized = shipped.read_text(encoding="utf-8").replace("\r\n", "\n")
-    assert normalized == render_corpus_yaml([])
+    loaded = load_corpus_config(shipped)
+    assert normalized == render_corpus_yaml(loaded.documents)
 
 
 def test_render_corpus_yaml_round_trips_documents(tmp_path: Path) -> None:
