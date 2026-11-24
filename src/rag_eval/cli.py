@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -19,14 +20,23 @@ from rag_eval.config import (
     load_providers_config,
     resolve_api_key,
 )
+from rag_eval.ingest.canonical_parser import (
+    CanonicalParseError,
+    parse_pdf,
+    write_canonical_document,
+)
 from rag_eval.ingest.downloader import download_corpus
 from rag_eval.ingest.manifest import (
     DEFAULT_CORPUS_CONFIG_PATH,
+    DEFAULT_MANIFEST_FILENAME,
     DEFAULT_RAW_DIR,
     ManifestEntry,
     ManifestError,
+    load_corpus_config,
     scan_local_pdfs,
+    sha256_file,
 )
+from rag_eval.ingest.models import CanonicalDocument
 from rag_eval.providers.embeddings import EmbeddingClient, EmbeddingError
 from rag_eval.providers.llm import AllProvidersFailed, LLMRouter
 from rag_eval.providers.rerank import Reranker, RerankError
@@ -361,6 +371,218 @@ def corpus_download(
         raise typer.Exit(code=1)
 
     typer.secho("OK    corpus is ready", fg=typer.colors.GREEN)
+
+
+@corpus_app.command("parse")
+def corpus_parse(
+    config: Path = typer.Option(
+        DEFAULT_CORPUS_CONFIG_PATH, "--config", "-c", help="Path to corpus.yaml."
+    ),
+    manifest: Path = typer.Option(
+        DEFAULT_RAW_DIR / DEFAULT_MANIFEST_FILENAME,
+        "--manifest",
+        help="Path to data/raw/manifest.json.",
+    ),
+    raw_dir: Path = typer.Option(DEFAULT_RAW_DIR, "--raw-dir", help="Directory holding the PDFs."),
+    out_dir: Path = typer.Option(
+        Path("data/processed/docs"), "--out-dir", help="Canonical JSON output directory."
+    ),
+) -> None:
+    """Parse verified PDFs into canonical JSON documents."""
+    if not manifest.is_file():
+        typer.secho(f"FAIL  manifest not found: {manifest}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        entries = [
+            ManifestEntry.model_validate(item) for item in payload.get("documents", [])
+        ]
+    except (ValueError, KeyError, TypeError) as exc:
+        typer.secho(f"FAIL  invalid manifest {manifest}: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+    metadata = {}
+    if config.is_file():
+        try:
+            corpus = load_corpus_config(config)
+        except ManifestError as exc:
+            typer.secho(f"FAIL  {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from None
+        metadata = {document.doc_id: document for document in corpus.documents}
+
+    verified = [
+        entry for entry in entries if entry.status in {"downloaded", "local_verified"}
+    ]
+    if not verified:
+        typer.secho("WARN  no verified documents in the manifest", fg=typer.colors.YELLOW)
+        return
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    failures = 0
+    for entry in verified:
+        pdf_path = Path(entry.local_path)
+        if not pdf_path.is_file():
+            fallback = raw_dir / pdf_path.name
+            if fallback.is_file():
+                pdf_path = fallback
+        if not pdf_path.is_file():
+            rows.append((entry.doc_id, "-", "-", "-", "missing file"))
+            failures += 1
+            continue
+
+        actual_sha256 = sha256_file(pdf_path)
+        if entry.sha256 is not None and actual_sha256 != entry.sha256:
+            rows.append((entry.doc_id, "-", "-", "-", "sha256 mismatch"))
+            failures += 1
+            continue
+
+        meta = metadata.get(entry.doc_id)
+        title = meta.title if meta is not None else entry.title
+        source_url = meta.source_url if meta is not None else entry.source_url
+        if meta is not None and meta.effective_date is not None:
+            effective_date = meta.effective_date.isoformat()
+        elif entry.effective_date is not None:
+            effective_date = entry.effective_date.isoformat()
+        else:
+            effective_date = None
+
+        try:
+            document = parse_pdf(
+                pdf_path,
+                doc_id=entry.doc_id,
+                title=title,
+                sha256=actual_sha256,
+                source_url=source_url,
+                effective_date=effective_date,
+            )
+        except CanonicalParseError as exc:
+            rows.append((entry.doc_id, "-", "-", "-", f"parse failed: {exc}"))
+            failures += 1
+            continue
+
+        target = write_canonical_document(document, out_dir)
+        rows.append(
+            (
+                document.doc_id,
+                str(document.page_count),
+                str(document.table_count),
+                f"{document.token_count:,}",
+                f"parsed -> {target.name}",
+            )
+        )
+
+    table = Table(title="corpus parse", header_style="bold")
+    table.add_column("doc_id", no_wrap=True)
+    table.add_column("pages", justify="right", no_wrap=True)
+    table.add_column("tables", justify="right", no_wrap=True)
+    table.add_column("tokens", justify="right", no_wrap=True)
+    table.add_column("result", overflow="fold")
+    for doc_id, pages, tables, tokens, result in rows:
+        style = "red" if result.startswith(("missing", "sha256", "parse failed")) else "green"
+        table.add_row(doc_id, pages, tables, tokens, Text(result, style=style))
+    Console().print(table)
+    typer.echo("")
+    typer.echo(f"output  {out_dir}")
+    typer.echo(f"total {len(verified)}  parsed {len(verified) - failures}  failed {failures}")
+
+    if failures:
+        typer.secho(
+            "FAIL  some documents could not be parsed; see the table above",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.secho("OK    all verified documents parsed", fg=typer.colors.GREEN)
+
+
+@corpus_app.command("stats")
+def corpus_stats(
+    docs_dir: Path = typer.Option(
+        Path("data/processed/docs"), "--docs-dir", help="Canonical JSON directory."
+    ),
+    max_tokens: int | None = typer.Option(
+        None, "--max-tokens", help="Exit 1 if total tokens exceed this budget."
+    ),
+    strict: bool = typer.Option(
+        False, "--strict", help="Exit 1 if total tokens exceed the 750k alert threshold."
+    ),
+) -> None:
+    """Summarise parsed documents from precomputed canonical JSON."""
+    files = sorted(docs_dir.glob("*.json"))
+    if not files:
+        typer.secho(
+            "WARN  no parsed documents; run `rag-eval corpus parse` first",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    total_pages = total_chars = total_tables = total_tokens = 0
+    skipped = 0
+    for path in files:
+        try:
+            document = CanonicalDocument.model_validate(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (ValueError, KeyError) as exc:
+            typer.secho(f"WARN  skipping {path.name}: {exc}", fg=typer.colors.YELLOW)
+            skipped += 1
+            continue
+        rows.append(
+            (
+                document.doc_id,
+                str(document.page_count),
+                f"{len(document.full_text):,}",
+                str(document.table_count),
+                f"{document.token_count:,}",
+            )
+        )
+        total_pages += document.page_count
+        total_chars += len(document.full_text)
+        total_tables += document.table_count
+        total_tokens += document.token_count
+
+    table = Table(title="corpus stats", header_style="bold")
+    table.add_column("doc_id", no_wrap=True)
+    table.add_column("pages", justify="right", no_wrap=True)
+    table.add_column("chars", justify="right", no_wrap=True)
+    table.add_column("tables", justify="right", no_wrap=True)
+    table.add_column("tokens", justify="right", no_wrap=True)
+    for row in rows:
+        table.add_row(*row)
+    Console().print(table)
+    typer.echo("")
+    typer.echo(
+        f"documents {len(rows)}  pages {total_pages}  chars {total_chars:,}  "
+        f"tables {total_tables}  tokens {total_tokens:,}"
+    )
+    if skipped:
+        typer.echo(f"skipped {skipped} unreadable document(s)")
+
+    if total_tokens > 750_000:
+        typer.secho(
+            f"ALERT  total tokens {total_tokens:,} exceed 750,000; reduce the corpus "
+            "before running paid or rate-limited calls",
+            fg=typer.colors.RED,
+            err=True,
+        )
+    elif total_tokens > 500_000:
+        typer.secho(
+            f"WARN  total tokens {total_tokens:,} exceed 500,000; approaching the "
+            "free-tier budget",
+            fg=typer.colors.YELLOW,
+        )
+
+    if strict and total_tokens > 750_000:
+        raise typer.Exit(code=1)
+    if max_tokens is not None and total_tokens > max_tokens:
+        typer.secho(
+            f"FAIL  total tokens {total_tokens:,} exceed --max-tokens {max_tokens:,}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 def _print_manifest(entries: list[ManifestEntry]) -> None:
