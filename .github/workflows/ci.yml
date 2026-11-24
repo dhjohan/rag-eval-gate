@@ -26,6 +26,9 @@ jobs:
       - name: Lint
         run: uv run ruff check src tests
 
+      - name: Type check
+        run: uv run mypy src tests
+
       - name: Tests (fully offline, no secrets)
         run: uv run pytest -q
 

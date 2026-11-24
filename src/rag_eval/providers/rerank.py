@@ -6,6 +6,8 @@ return ``(index, score)`` pairs that preserve the caller's document order.
 
 from __future__ import annotations
 
+import random
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +15,7 @@ from typing import Any
 import httpx
 
 from rag_eval.config import RerankConfig, resolve_api_key
+from rag_eval.providers.rate_limit import compute_backoff, parse_retry_after
 
 
 class RerankError(RuntimeError):
@@ -33,11 +36,21 @@ class Reranker:
         api_key_resolver: Callable[[str], str | None] | None = None,
         transport: httpx.BaseTransport | None = None,
         client: httpx.Client | None = None,
+        max_retries: int = 2,
+        backoff_base_s: float = 1.0,
+        backoff_cap_s: float = 30.0,
+        sleep: Callable[[float], None] = time.sleep,
+        rng: random.Random | None = None,
     ) -> None:
         self._config = config
         self._resolve_key = api_key_resolver or (lambda name: resolve_api_key(name))
         self._client = client or httpx.Client(transport=transport)
         self._owns_client = client is None
+        self._max_retries = max_retries
+        self._backoff_base_s = backoff_base_s
+        self._backoff_cap_s = backoff_cap_s
+        self._sleep = sleep
+        self._rng = rng or random.Random(0)
 
     def close(self) -> None:
         if self._owns_client:
@@ -81,24 +94,13 @@ class Reranker:
             "top_n": limit,
             "return_documents": False,
         }
+        response = self._post_with_retries(payload, api_key)
         try:
-            response = self._client.post(
-                f"{self._config.base_url}/rerank",
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-                timeout=self._config.timeout_s,
-            )
-        except httpx.HTTPError as exc:
-            raise RerankError(f"rerank transport error: {exc}") from exc
-
-        if response.status_code >= 400:
-            raise RerankError(f"rerank HTTP {response.status_code}: {response.text[:200]}")
-
-        body = response.json()
+            body = response.json()
+        except ValueError as exc:
+            raise RerankError(f"rerank returned invalid JSON: {exc}") from exc
+        if not isinstance(body, dict):
+            raise RerankError("rerank response was not a JSON object")
         results = body.get("results")
         if not isinstance(results, list):
             raise RerankError("rerank response had no 'results' list")
@@ -117,3 +119,46 @@ class Reranker:
 
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return hits[:limit]
+
+    def _post_with_retries(self, payload: dict[str, Any], api_key: str) -> httpx.Response:
+        """POST once, retrying transient statuses and timeouts with backoff."""
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = self._client.post(
+                    f"{self._config.base_url}/rerank",
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    timeout=self._config.timeout_s,
+                )
+            except httpx.TimeoutException as exc:
+                if attempt < self._max_retries:
+                    self._sleep(self._backoff(attempt))
+                    continue
+                raise RerankError(f"rerank transport error: {exc}") from exc
+            except httpx.HTTPError as exc:
+                raise RerankError(f"rerank transport error: {exc}") from exc
+
+            status = response.status_code
+            if status == 429 or status >= 500:
+                if attempt < self._max_retries:
+                    retry_after = parse_retry_after(response.headers.get("retry-after"))
+                    delay = retry_after if retry_after is not None else self._backoff(attempt)
+                    self._sleep(min(delay, self._backoff_cap_s))
+                    continue
+                raise RerankError(f"rerank HTTP {status}: {response.text[:200]}")
+            if status >= 400:
+                raise RerankError(f"rerank HTTP {status}: {response.text[:200]}")
+            return response
+        raise RerankError("rerank failed without a response")  # pragma: no cover
+
+    def _backoff(self, attempt: int) -> float:
+        return compute_backoff(
+            attempt,
+            base_s=self._backoff_base_s,
+            cap_s=self._backoff_cap_s,
+            rng=self._rng,
+        )

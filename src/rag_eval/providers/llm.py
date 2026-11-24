@@ -146,19 +146,6 @@ class LLMRouter:
             self._config.prompt_cache_enabled if use_cache is None else use_cache
         )
         target = response_model.__name__ if response_model is not None else "freeform"
-        prompt_hash = sha256_text(
-            canonical_json(
-                {
-                    "messages": [dict(m) for m in messages],
-                    "schema": (
-                        response_model.model_json_schema() if response_model is not None else None
-                    ),
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "reasoning_effort": reasoning_effort,
-                }
-            )
-        )
 
         if cache_enabled:
             # A cached answer is only valid for the provider/model that produced
@@ -167,6 +154,14 @@ class LLMRouter:
             cached = None
             for name in self._candidate_order(response_model):
                 cfg = self._config.providers[name]
+                prompt_hash = self._prompt_hash(
+                    messages,
+                    response_model,
+                    temperature,
+                    max_tokens,
+                    reasoning_effort,
+                    cfg,
+                )
                 candidate = self._cache.get_llm_response(
                     prompt_hash,
                     target,
@@ -206,6 +201,14 @@ class LLMRouter:
                 failures.append(ProviderFailure(name, f"missing_api_key:{cfg.api_key_env}"))
                 continue
 
+            prompt_hash = self._prompt_hash(
+                messages,
+                response_model,
+                temperature,
+                max_tokens,
+                reasoning_effort,
+                cfg,
+            )
             result = self._try_provider(
                 name,
                 cfg,
@@ -248,6 +251,36 @@ class LLMRouter:
             ),
         )
         return [name for _, name in ranked]
+
+    def _prompt_hash(
+        self,
+        messages: Messages,
+        response_model: type[BaseModel] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        reasoning_effort: str | None,
+        cfg: LLMProviderConfig,
+    ) -> str:
+        """Hash the prompt plus the *effective* per-provider request parameters.
+
+        Hashing the raw arguments would replay a stale answer after a provider's
+        configured ``max_tokens`` or ``reasoning_effort`` changes.
+        """
+        effective_max_tokens = max_tokens if max_tokens is not None else cfg.max_tokens
+        effective_effort = reasoning_effort or cfg.reasoning_effort
+        return sha256_text(
+            canonical_json(
+                {
+                    "messages": [dict(message) for message in messages],
+                    "schema": (
+                        response_model.model_json_schema() if response_model is not None else None
+                    ),
+                    "temperature": temperature,
+                    "max_tokens": effective_max_tokens,
+                    "reasoning_effort": effective_effort,
+                }
+            )
+        )
 
     def _try_provider(
         self,
@@ -305,6 +338,10 @@ class LLMRouter:
             status = response.status_code
 
             if status == 429:
+                # The provider rejected before processing, so return the slot
+                # before retrying; otherwise one throttled call would burn the
+                # daily budget once per attempt.
+                limiter.release()
                 if attempt < self._config.max_retries:
                     retry_after = parse_retry_after(response.headers.get("retry-after"))
                     delay = retry_after if retry_after is not None else self._backoff(attempt)
@@ -419,7 +456,7 @@ class LLMRouter:
                     "type": "json_schema",
                     "json_schema": {
                         "name": response_model.__name__,
-                        "schema": response_model.model_json_schema(),
+                        "schema": _strict_json_schema(response_model.model_json_schema()),
                         "strict": True,
                     },
                 }
@@ -430,11 +467,34 @@ class LLMRouter:
 
 
 def _schema_instruction(response_model: type[BaseModel]) -> str:
-    schema = json.dumps(response_model.model_json_schema(), sort_keys=True)
+    schema = json.dumps(
+        _strict_json_schema(response_model.model_json_schema()), sort_keys=True
+    )
     return (
         "Respond with a single JSON object and nothing else. "
         f"It must validate against this JSON Schema:\n{schema}"
     )
+
+
+def _strict_json_schema(schema: Any) -> Any:
+    """Close every object and require every property for strict schema mode.
+
+    OpenAI-compatible strict validators reject a schema where an object lacks
+    ``additionalProperties: false`` or where a property is absent from
+    ``required``. Pydantic only emits the former for ``extra="forbid"`` models
+    and leaves optional fields out of ``required``.
+    """
+    if isinstance(schema, dict):
+        normalised = {key: _strict_json_schema(value) for key, value in schema.items()}
+        if normalised.get("type") == "object":
+            normalised["additionalProperties"] = False
+            properties = normalised.get("properties")
+            if isinstance(properties, dict):
+                normalised["required"] = list(properties)
+        return normalised
+    if isinstance(schema, list):
+        return [_strict_json_schema(item) for item in schema]
+    return schema
 
 
 def _extract_content(body: Any) -> str:
@@ -461,7 +521,7 @@ def _parse_structured(text: str, response_model: type[BaseModel]) -> BaseModel:
     # Reasoning models (e.g. Nemotron Ultra) wrap answers in
     # <think>...</think> blocks; strip them before JSON parsing.
     cleaned = re.sub(
-        r"\x3cthink\x3e.*?\x3c/think\x3e",
+        r" thinking.*?</think>",
         "",
         cleaned,
         flags=re.DOTALL | re.IGNORECASE,
@@ -477,12 +537,13 @@ def _parse_structured(text: str, response_model: type[BaseModel]) -> BaseModel:
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Some models wrap JSON in prose; salvage the outermost object.
-        start, end = cleaned.find("{"), cleaned.rfind("}")
-        if start == -1 or end <= start:
+        # Some models wrap JSON in prose; decode the first complete object and
+        # ignore anything that follows it (including stray closing braces).
+        start = cleaned.find("{")
+        if start == -1:
             raise LLMError("model did not return valid JSON") from None
         try:
-            data = json.loads(cleaned[start : end + 1])
+            data, _end = json.JSONDecoder().raw_decode(cleaned, start)
         except json.JSONDecodeError as exc:
             raise LLMError(f"model did not return valid JSON: {exc}") from exc
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,6 @@ import httpx
 import pytest
 import yaml
 from pydantic import ValidationError
-from tenacity import wait_none
 from typer.testing import CliRunner
 
 from rag_eval.cli import app
@@ -30,6 +30,7 @@ from rag_eval.ingest.manifest import (
     scan_local_pdfs,
     verify_pdf_file,
     write_corpus_config,
+    write_manifest,
 )
 
 Handler = Callable[[httpx.Request], httpx.Response]
@@ -89,7 +90,7 @@ def test_downloads_pdf_atomically_and_writes_manifest(tmp_path: Path) -> None:
         return httpx.Response(200, content=payload)
 
     summary = download_corpus(
-        config, raw, transport=transport(handler), wait=wait_none()
+        config, raw, transport=transport(handler), wait=lambda _: 0.0
     )
 
     target = raw / "fda-test-guidance.pdf"
@@ -123,6 +124,108 @@ def test_downloads_pdf_atomically_and_writes_manifest(tmp_path: Path) -> None:
     }
 
 
+def test_streaming_rejects_html_before_reading_the_whole_body(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    config = write_corpus(
+        tmp_path,
+        [
+            {
+                "doc_id": "fda-waf-stream",
+                "title": "WAF page",
+                "source_url": "https://example.invalid/waf.pdf",
+            }
+        ],
+    )
+    consumed: list[int] = []
+
+    def chunks():
+        for chunk in [b"<html>", b"x" * 4096, b"y" * 4096]:
+            consumed.append(len(chunk))
+            yield chunk
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=chunks())
+
+    summary = download_corpus(
+        config, raw, transport=transport(handler), wait=lambda _: 0.0
+    )
+
+    # httpx buffers iterator content eagerly, so the full body is read by the
+    # transport; the important behaviour is that we still reject it on the
+    # magic-byte check and publish nothing.
+    entry = summary.entries[0]
+    assert entry.status == "failed"
+    assert entry.error is not None
+    assert "not a PDF" in entry.error
+    assert not (raw / "fda-waf-stream.pdf").exists()
+    assert not list(raw.glob("*.tmp"))
+    assert consumed  # the first chunk was at least read
+
+
+def test_local_only_run_never_builds_a_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    payload = make_pdf(1500)
+    (raw / "custom-name.pdf").write_bytes(payload)
+    config = write_corpus(
+        tmp_path,
+        [
+            {
+                "doc_id": "fda-custom",
+                "title": "Custom",
+                "local_filename": "custom-name.pdf",
+                "expected_sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        ],
+    )
+
+    called = []
+
+    def build(**kwargs: object) -> httpx.Client:
+        called.append(True)
+        raise AssertionError("local-only runs must not build an HTTP client")
+
+    monkeypatch.setattr("rag_eval.ingest.downloader.build_client", build)
+
+    summary = download_corpus(config, raw)
+
+    assert called == []
+    assert [entry.status for entry in summary.entries] == ["local_verified"]
+    assert read_manifest(raw)["documents"][0]["status"] == "local_verified"
+
+
+def test_write_corpus_config_cleans_up_tmp_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "corpus.yaml"
+    monkeypatch.setattr(
+        "rag_eval.ingest.manifest.os.replace",
+        lambda src, dst: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        write_corpus_config(config, [])
+
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_write_manifest_cleans_up_tmp_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    monkeypatch.setattr(
+        "rag_eval.ingest.manifest.os.replace",
+        lambda src, dst: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        write_manifest(manifest, [])
+
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 def test_rejects_html_200_without_leaving_files(tmp_path: Path) -> None:
     raw = tmp_path / "raw"
     config = write_corpus(
@@ -143,10 +246,11 @@ def test_rejects_html_200_without_leaving_files(tmp_path: Path) -> None:
             headers={"content-type": "text/html"},
         )
 
-    summary = download_corpus(config, raw, transport=transport(handler), wait=wait_none())
+    summary = download_corpus(config, raw, transport=transport(handler), wait=lambda _: 0.0)
 
     entry = summary.entries[0]
     assert entry.status == "failed"
+    assert entry.error is not None
     assert "not a PDF" in entry.error
     assert not (raw / "fda-waf.pdf").exists()
     assert not list(raw.glob("*.tmp"))
@@ -169,7 +273,7 @@ def test_retries_transient_429_then_succeeds(tmp_path: Path) -> None:
         return httpx.Response(429)
 
     summary = download_corpus(
-        config, raw, transport=transport(handler), max_attempts=3, wait=wait_none()
+        config, raw, transport=transport(handler), max_attempts=3, wait=lambda _: 0.0
     )
 
     assert statuses == []
@@ -194,10 +298,11 @@ def test_403_is_not_retried_and_explains_manual_download(tmp_path: Path) -> None
         calls.append(request)
         return httpx.Response(403, text="forbidden")
 
-    summary = download_corpus(config, raw, transport=transport(handler), wait=wait_none())
+    summary = download_corpus(config, raw, transport=transport(handler), wait=lambda _: 0.0)
 
     entry = summary.entries[0]
     assert entry.status == "failed"
+    assert entry.error is not None
     assert "403" in entry.error
     assert "manually" in entry.error
     assert len(calls) == 1
@@ -226,7 +331,7 @@ def test_expected_sha256_match_downloads(tmp_path: Path) -> None:
         config,
         raw,
         transport=transport(lambda request: httpx.Response(200, content=payload)),
-        wait=wait_none(),
+        wait=lambda _: 0.0,
     )
 
     assert summary.entries[0].status == "downloaded"
@@ -251,11 +356,12 @@ def test_expected_sha256_mismatch_fails_and_removes_file(tmp_path: Path) -> None
         config,
         raw,
         transport=transport(lambda request: httpx.Response(200, content=payload)),
-        wait=wait_none(),
+        wait=lambda _: 0.0,
     )
 
     entry = summary.entries[0]
     assert entry.status == "failed"
+    assert entry.error is not None
     assert "sha256 mismatch" in entry.error
     assert not (raw / "fda-tampered.pdf").exists()
     assert not list(raw.glob("*.tmp"))
@@ -331,6 +437,7 @@ def test_corrupt_local_file_fails_without_network(tmp_path: Path) -> None:
 
     entry = summary.entries[0]
     assert entry.status == "failed"
+    assert entry.error is not None
     assert "local file failed verification" in entry.error
     assert calls == []
     # The corrupt file is preserved for inspection instead of being overwritten.
@@ -348,11 +455,12 @@ def test_missing_document_without_source_url_fails_with_hint(tmp_path: Path) -> 
         config,
         raw,
         transport=transport(lambda request: httpx.Response(500)),
-        wait=wait_none(),
+        wait=lambda _: 0.0,
     )
 
     entry = summary.entries[0]
     assert entry.status == "failed"
+    assert entry.error is not None
     assert "no source_url" in entry.error
     assert str(raw / "local.pdf") in entry.error
 
@@ -380,7 +488,7 @@ def test_partial_failure_records_both_statuses(tmp_path: Path) -> None:
             return httpx.Response(200, content=good)
         return httpx.Response(403)
 
-    summary = download_corpus(config, raw, transport=transport(handler), wait=wait_none())
+    summary = download_corpus(config, raw, transport=transport(handler), wait=lambda _: 0.0)
 
     assert [entry.status for entry in summary.entries] == ["downloaded", "failed"]
     assert summary.ok_count == 1
@@ -538,6 +646,18 @@ def test_scan_local_requires_a_raw_directory(tmp_path: Path) -> None:
         scan_local_pdfs(tmp_path / "missing", tmp_path / "corpus.yaml")
 
 
+def test_scan_local_is_case_insensitive_on_all_platforms(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "UPPER.PDF").write_bytes(make_pdf())
+    config = tmp_path / "corpus.yaml"
+
+    result = scan_local_pdfs(raw, config)
+
+    assert result.added == ["upper"]
+    assert load_corpus_config(config).documents[0].local_filename == "UPPER.PDF"
+
+
 def test_cli_scan_local_registers_pdfs(tmp_path: Path) -> None:
     raw = tmp_path / "raw"
     raw.mkdir()
@@ -631,7 +751,7 @@ def test_render_corpus_yaml_round_trips_documents(tmp_path: Path) -> None:
         doc_id="fda-round-trip",
         title="Round trip",
         local_filename="round-trip.pdf",
-        effective_date="2024-01-15",
+        effective_date=date(2024, 1, 15),
     )
     config = tmp_path / "corpus.yaml"
     write_corpus_config(config, [document])

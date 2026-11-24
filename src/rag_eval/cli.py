@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import typer
@@ -216,25 +217,26 @@ def _live_probe(
         try:
             if target == "embedding":
                 client = EmbeddingClient(providers.embeddings, cache, api_key_resolver=resolver)
-                result = client.embed_texts(["rag-eval doctor probe"])
-                norm = float((result.vectors[0] ** 2).sum() ** 0.5)
+                embedding_result = client.embed_texts(["rag-eval doctor probe"])
+                norm = float((embedding_result.vectors[0] ** 2).sum() ** 0.5)
                 typer.secho(
-                    f"OK    embedding via {result.provider_used} ({result.model_used}) "
-                    f"shape={result.vectors.shape} L2={norm:.4f}",
+                    f"OK    embedding via {embedding_result.provider_used} "
+                    f"({embedding_result.model_used}) "
+                    f"shape={embedding_result.vectors.shape} L2={norm:.4f}",
                     fg=typer.colors.GREEN,
                 )
             elif target == "llm":
                 router = LLMRouter(providers.llm, cache, api_key_resolver=resolver)
                 try:
-                    result = router.generate(
+                    llm_result = router.generate(
                         [{"role": "user", "content": "Reply with the single word OK."}],
                         use_cache=False,
                     )
                 finally:
                     router.close()
                 typer.secho(
-                    f"OK    llm via {result.provider_used} ({result.model_used}) "
-                    f"tokens={result.usage_tokens} latency={result.latency_ms}ms",
+                    f"OK    llm via {llm_result.provider_used} ({llm_result.model_used}) "
+                    f"tokens={llm_result.usage_tokens} latency={llm_result.latency_ms}ms",
                     fg=typer.colors.GREEN,
                 )
             else:
@@ -380,7 +382,8 @@ def _print_manifest(entries: list[ManifestEntry]) -> None:
     Console().print(table)
 
 
-def _table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
+def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    """Plain, deterministic table for machine-friendly doctor output."""
     widths = [
         max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i])
         for i in range(len(headers))

@@ -17,6 +17,8 @@ def make_reranker(
     handler: Handler,
     *,
     key: str | None = "secret",
+    sleep: Callable[[float], None] | None = None,
+    max_retries: int = 2,
     **overrides: Any,
 ) -> Reranker:
     payload: dict[str, Any] = {
@@ -32,6 +34,8 @@ def make_reranker(
         config,
         api_key_resolver=lambda name: key,
         transport=httpx.MockTransport(handler),
+        sleep=sleep or (lambda _: None),
+        max_retries=max_retries,
     )
 
 
@@ -117,3 +121,49 @@ def test_malformed_payload_is_rejected() -> None:
     reranker = make_reranker(lambda request: httpx.Response(200, json={"oops": []}))
     with pytest.raises(RerankError, match="results"):
         reranker.rerank("q", ["a"])
+
+
+def test_non_json_success_is_wrapped() -> None:
+    reranker = make_reranker(lambda request: httpx.Response(200, text="<html>blocked</html>"))
+    with pytest.raises(RerankError, match="invalid JSON"):
+        reranker.rerank("q", ["a"])
+
+
+def test_non_object_payload_is_rejected() -> None:
+    reranker = make_reranker(lambda request: httpx.Response(200, json=[1, 2, 3]))
+    with pytest.raises(RerankError, match="not a JSON object"):
+        reranker.rerank("q", ["a"])
+
+
+def test_429_is_retried_then_succeeds() -> None:
+    sleeps: list[float] = []
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"retry-after": "2"})
+        return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 1.0}]})
+
+    reranker = make_reranker(handler, sleep=sleeps.append)
+    hits = reranker.rerank("q", ["a"])
+
+    assert attempts == 2
+    assert sleeps == [2.0]
+    assert hits[0].index == 0
+
+
+def test_5xx_exhausts_retries() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, text="down")
+
+    reranker = make_reranker(handler, max_retries=2)
+    with pytest.raises(RerankError, match="503"):
+        reranker.rerank("q", ["a"])
+
+    assert attempts == 3

@@ -49,7 +49,13 @@ class EmbeddingResult:
 class EmbeddingBackend(Protocol):
     """Minimal seam so tests never need the network."""
 
-    def embed(self, texts: Sequence[str], *, task_type: str | None) -> list[list[float]]: ...
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        task_type: str | None,
+        on_vector: Callable[[int, Sequence[float]], None] | None = None,
+    ) -> list[list[float]]: ...
 
 
 class GoogleEmbeddingBackend:
@@ -61,21 +67,33 @@ class GoogleEmbeddingBackend:
         api_key: str,
         model: str,
         dims: int,
+        timeout_s: float = 60.0,
         client: Any | None = None,
     ) -> None:
         self._api_key = api_key
         self.model = model
         self.dims = dims
+        self.timeout_s = timeout_s
         self._client = client
 
     def _get_client(self) -> Any:
         if self._client is None:
             from google import genai
+            from google.genai import types
 
-            self._client = genai.Client(api_key=self._api_key)
+            self._client = genai.Client(
+                api_key=self._api_key,
+                http_options=types.HttpOptions(timeout=int(self.timeout_s * 1000)),
+            )
         return self._client
 
-    def embed(self, texts: Sequence[str], *, task_type: str | None) -> list[list[float]]:
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        task_type: str | None,
+        on_vector: Callable[[int, Sequence[float]], None] | None = None,
+    ) -> list[list[float]]:
         from google.genai import types
 
         config_kwargs: dict[str, Any] = {"output_dimensionality": self.dims}
@@ -85,7 +103,7 @@ class GoogleEmbeddingBackend:
 
         client = self._get_client()
         vectors: list[list[float]] = []
-        for text in texts:
+        for position, text in enumerate(texts):
             # gemini-embedding-2 aggregates multiple inputs into one vector, so
             # each chunk is embedded on its own to keep cache keys 1:1.
             try:
@@ -100,7 +118,12 @@ class GoogleEmbeddingBackend:
             values = getattr(embeddings[0], "values", None)
             if not values:
                 raise EmbeddingError("google embedding returned an empty vector")
-            vectors.append(list(values))
+            vector = list(values)
+            vectors.append(vector)
+            # Report progress so a mid-batch failure does not throw away the
+            # vectors that were already paid for.
+            if on_vector is not None:
+                on_vector(position, vector)
         return vectors
 
 
@@ -130,7 +153,13 @@ class JinaEmbeddingBackend:
         if self._owns_client:
             self._client.close()
 
-    def embed(self, texts: Sequence[str], *, task_type: str | None) -> list[list[float]]:
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        task_type: str | None,
+        on_vector: Callable[[int, Sequence[float]], None] | None = None,
+    ) -> list[list[float]]:
         payload: dict[str, Any] = {
             "model": self.model,
             "input": list(texts),
@@ -155,12 +184,26 @@ class JinaEmbeddingBackend:
             raise EmbeddingError(
                 f"jina embedding HTTP {response.status_code}: {response.text[:200]}"
             )
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise EmbeddingError(f"jina embedding returned invalid JSON: {exc}") from exc
+        if not isinstance(body, dict):
+            raise EmbeddingError("jina embedding returned a non-object payload")
         items = body.get("data")
         if not isinstance(items, list) or len(items) != len(texts):
             raise EmbeddingError("jina embedding returned an unexpected payload")
-        ordered = sorted(items, key=lambda item: item.get("index", 0))
-        return [list(item["embedding"]) for item in ordered]
+        try:
+            ordered = sorted(items, key=lambda item: item.get("index", 0))
+            vectors = [list(item["embedding"]) for item in ordered]
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise EmbeddingError(
+                f"jina embedding returned an unexpected payload: {exc}"
+            ) from exc
+        if on_vector is not None:
+            for position, vector in enumerate(vectors):
+                on_vector(position, vector)
+        return vectors
 
 
 class EmbeddingClient:
@@ -238,57 +281,108 @@ class EmbeddingClient:
                 )
 
             missing = [index for index, vector in enumerate(cached) if vector is None]
-            fresh: list[list[float]] | None = None
-            normalised: list[np.ndarray] | None = None
-            for attempt in range(self._max_retries + 1):
-                backend: EmbeddingBackend | None = None
-                try:
-                    backend = self._backend_factory(name, cfg, api_key)
-                    fresh = backend.embed(
-                        [texts[index] for index in missing], task_type=effective_task
-                    )
-                    if len(fresh) != len(missing):
-                        raise EmbeddingError(
-                            f"returned {len(fresh)} vectors for {len(missing)} inputs"
-                        )
-                    normalised = [_normalise(vector, cfg.dims) for vector in fresh]
-                    break
-                except EmbeddingError as exc:
-                    if attempt < self._max_retries:
-                        self._sleep(
-                            compute_backoff(
-                                attempt,
-                                base_s=self._backoff_base_s,
-                                cap_s=self._backoff_cap_s,
-                                rng=self._rng,
-                            )
-                        )
-                        continue
-                    failures.append(f"{name}: {exc}")
-                    break
-                finally:
-                    if backend is not None:
-                        close = getattr(backend, "close", None)
-                        if callable(close):
-                            close()
-            if fresh is None or normalised is None:
-                continue
+            cache_misses = len(missing)
+            indices_by_hash: dict[str, list[int]] = {}
+            for index in missing:
+                indices_by_hash.setdefault(hashes[index], []).append(index)
 
-            for index, vector in zip(missing, normalised, strict=True):
-                self._cache.put_embedding(hashes[index], model_id, cfg.dims, vector)
-                cached[index] = vector
+            backend: EmbeddingBackend | None = None
+            try:
+                # Build the backend once and reuse it across retries so a
+                # transient failure does not pay for a new TLS handshake.
+                backend = self._backend_factory(name, cfg, api_key)
+                for attempt in range(self._max_retries + 1):
+                    pending = [index for index in missing if cached[index] is None]
+                    if not pending:
+                        break
+                    batch: list[int] = []
+                    seen: set[str] = set()
+                    for index in pending:
+                        digest = hashes[index]
+                        if digest not in seen:
+                            seen.add(digest)
+                            batch.append(index)
+                    try:
+                        self._embed_batch(
+                            backend,
+                            cfg,
+                            model_id,
+                            texts,
+                            hashes,
+                            batch,
+                            indices_by_hash,
+                            effective_task,
+                            cached,
+                        )
+                    except EmbeddingError as exc:
+                        if attempt < self._max_retries:
+                            self._sleep(
+                                compute_backoff(
+                                    attempt,
+                                    base_s=self._backoff_base_s,
+                                    cap_s=self._backoff_cap_s,
+                                    rng=self._rng,
+                                )
+                            )
+                            continue
+                        failures.append(f"{name}: {exc}")
+                        break
+            except EmbeddingError as exc:
+                failures.append(f"{name}: {exc}")
+                continue
+            finally:
+                if backend is not None:
+                    close = getattr(backend, "close", None)
+                    if callable(close):
+                        close()
+
+            if any(cached[index] is None for index in missing):
+                continue
 
             return EmbeddingResult(
                 vectors=np.vstack([vector for vector in cached if vector is not None]),
                 provider_used=name,
                 model_used=cfg.model,
                 cache_hits=hits,
-                cache_misses=len(missing),
+                cache_misses=cache_misses,
             )
 
         raise AllEmbeddingProvidersFailed(
             "no embedding provider available: " + "; ".join(failures)
         )
+
+    def _embed_batch(
+        self,
+        backend: EmbeddingBackend,
+        cfg: EmbeddingProviderConfig,
+        model_id: str,
+        texts: Sequence[str],
+        hashes: Sequence[str],
+        batch: Sequence[int],
+        indices_by_hash: dict[str, list[int]],
+        task_type: str | None,
+        cached: list[np.ndarray | None],
+    ) -> None:
+        """Embed one deduplicated batch, caching each vector as it arrives."""
+
+        def store(position: int, vector: Sequence[float]) -> None:
+            index = batch[position]
+            digest = hashes[index]
+            normalised = _normalise(vector, cfg.dims)
+            self._cache.put_embedding(digest, model_id, cfg.dims, normalised)
+            for duplicate in indices_by_hash[digest]:
+                cached[duplicate] = normalised
+
+        fresh = backend.embed(
+            [texts[index] for index in batch],
+            task_type=task_type,
+            on_vector=store,
+        )
+        if len(fresh) != len(batch):
+            raise EmbeddingError(f"returned {len(fresh)} vectors for {len(batch)} inputs")
+        for position, vector in enumerate(fresh):
+            if cached[batch[position]] is None:
+                store(position, vector)
 
 
 def _default_backend(
@@ -299,7 +393,12 @@ def _default_backend(
 ) -> EmbeddingBackend:
     model = cfg.model.lower()
     if model.startswith("gemini-embedding"):
-        return GoogleEmbeddingBackend(api_key=api_key, model=cfg.model, dims=cfg.dims)
+        return GoogleEmbeddingBackend(
+            api_key=api_key,
+            model=cfg.model,
+            dims=cfg.dims,
+            timeout_s=cfg.timeout_s,
+        )
     if model.startswith("jina-"):
         return JinaEmbeddingBackend(
             api_key=api_key,

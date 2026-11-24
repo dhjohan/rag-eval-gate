@@ -243,29 +243,19 @@ class SqliteCache:
     def try_consume_quota(self, provider: str, window_date: str, limit: int | None) -> bool:
         """Atomically reserve one request against a provider's daily budget.
 
-        Returns ``False`` without writing anything when the budget is exhausted,
-        so callers can skip the provider instead of burning a failing request.
+        A single upsert guarded by the limit keeps two concurrent processes from
+        both observing ``used = limit - 1`` and over-spending. Returns ``False``
+        without writing anything when the budget is exhausted.
         """
         with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT used FROM quota_usage WHERE provider = ? AND window_date = ?",
-                (provider, window_date),
-            ).fetchone()
-            used = int(row["used"]) if row is not None else 0
-            if limit is not None and used >= limit:
-                return False
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO quota_usage (provider, window_date, used) VALUES (?, ?, 1)",
-                    (provider, window_date),
-                )
-            else:
-                self._conn.execute(
-                    "UPDATE quota_usage SET used = used + 1 "
-                    "WHERE provider = ? AND window_date = ?",
-                    (provider, window_date),
-                )
-            return True
+            cursor = self._conn.execute(
+                "INSERT INTO quota_usage (provider, window_date, used) VALUES (?, ?, 1) "
+                "ON CONFLICT(provider, window_date) DO UPDATE SET "
+                "used = quota_usage.used + 1 "
+                "WHERE ? IS NULL OR quota_usage.used < ?",
+                (provider, window_date, limit, limit),
+            )
+            return cursor.rowcount > 0
 
     def release_quota(self, provider: str, window_date: str) -> None:
         """Undo a reservation, e.g. when a request never left the process."""
