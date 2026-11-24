@@ -23,7 +23,7 @@ metrics, or dashboards were implemented.
 | Rerank | `src/rag_eval/providers/rerank.py` | Jina reranker client |
 | CLI | `src/rag_eval/cli.py` | `doctor`, `cache-stats` |
 | CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard; mypy type check on push/PR |
-| Tests | `tests/` | 155 offline tests |
+| Tests | `tests/` | 187 offline tests |
 
 ## Provider catalog verification (2026-11-22)
 
@@ -195,6 +195,22 @@ A second, focused review of `providers/llm.py` found edge cases and one broken r
 
 Deliberately unchanged: 5xx responses still keep their quota slot. The provider saw and counted the request, and the existing test pins that decision. 429 / 401 / 403 / transport errors continue to release the slot.
 
+## Follow-up `ingest/` review fixes
+
+A review of `ingest/manifest.py` and `ingest/downloader.py` found corpus-integrity and HTTP edge cases. Fixes 1-7 were applied; 8-9 were postponed.
+
+| # | Area | Fix |
+|---|------|-----|
+| I1 | `CorpusConfig` | Validates that no two documents resolve to the same local PDF (case-folded), so a config cannot silently point two entries at one file |
+| I2 | `CorpusConfig` | `schema_version` is `Literal[1]` plus a before-validator that also rejects `True`/`False` and any value other than `1` |
+| I3 | `_unique_slug` | Suffix length is accounted for dynamically, so `-1000` cannot push a slug past the 80-character `doc_id` limit |
+| I4 | `load_corpus_config` | Wraps `OSError` / `UnicodeDecodeError` in `ManifestError` instead of leaking raw exceptions |
+| I5 | `PdfDownloader._attempt` | Explicit guard for `204` / non-2xx statuses, with a clear "unexpected HTTP N" message instead of a misleading WAF-page error |
+| I6 | `verify_pdf_file` / `_verify_streamed` | Boundary is now `size < MIN_PDF_BYTES` (a 1024-byte file passes); error text says "at least"; `head[:8]` simplified to `head` |
+| I7 | `download_corpus` | Exposes `timeout_s` and passes it through to `PdfDownloader` |
+
+Postponed: honoring `Retry-After` in tenacity's downloader wait, retrying non-timeout `httpx.TransportError` mid-stream, and concurrent temp-file safety.
+
 ## Design decisions worth remembering
 
 1. **Local-first is structural, not conditional.** `PdfDownloader.process`
@@ -231,7 +247,7 @@ $ python -m uv run ruff check src tests
 All checks passed!
 
 $ python -m uv run pytest -q
-155 passed in 1.53s
+187 passed in 1.76s
 
 $ python -m uv run mypy src tests
 # clean modulo pre-existing import-untyped stub notes

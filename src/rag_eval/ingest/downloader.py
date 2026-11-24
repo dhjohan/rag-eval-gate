@@ -289,6 +289,14 @@ class PdfDownloader:
                     raise RetryableStatusError(response.status_code, url)
                 if response.status_code >= 400:
                     raise DownloadError(_manual_download_hint(response.status_code, url, target))
+                if response.status_code == 204 or not 200 <= response.status_code < 300:
+                    # A successful download must be a 2xx with a body; a 204 or
+                    # an unfollowed 3xx would otherwise produce a misleading
+                    # "HTML/WAF" message after an empty stream.
+                    raise DownloadError(
+                        f"unexpected HTTP {response.status_code} for {url}; "
+                        "expected a PDF response"
+                    )
                 with tmp.open("wb") as handle:
                     for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
                         if not chunk:
@@ -323,7 +331,7 @@ class PdfDownloader:
 def _not_a_pdf_message(name: str, head: bytes) -> str:
     return (
         f"downloaded file failed verification: {name} is not a PDF: expected "
-        f"{PDF_MAGIC.decode()!r} magic bytes, got {head[:8]!r}. An HTML error page "
+        f"{PDF_MAGIC.decode()!r} magic bytes, got {head!r}. An HTML error page "
         "or WAF challenge was probably saved."
     )
 
@@ -339,10 +347,10 @@ def _verify_streamed(
     """Validate a stream that was hashed while it was written to disk."""
     if head != PDF_MAGIC:
         raise DownloadError(_not_a_pdf_message(name, head))
-    if size <= MIN_PDF_BYTES:
+    if size < MIN_PDF_BYTES:
         raise DownloadError(
             f"downloaded file failed verification: {name} is only {size} bytes; "
-            f"a valid PDF must exceed {MIN_PDF_BYTES}."
+            f"a valid PDF must be at least {MIN_PDF_BYTES} bytes."
         )
     if expected_sha256 is not None and digest != expected_sha256.strip().lower():
         raise DownloadError(
@@ -357,6 +365,7 @@ def download_corpus(
     *,
     client: httpx.Client | None = None,
     transport: httpx.BaseTransport | None = None,
+    timeout_s: float = 60.0,
     max_attempts: int = 3,
     wait: Callable[[Any], float] | None = None,
     manifest_path: str | Path | None = None,
@@ -371,6 +380,7 @@ def download_corpus(
         raw,
         client=client,
         transport=transport,
+        timeout_s=timeout_s,
         max_attempts=max_attempts,
         wait=wait,
     )

@@ -22,9 +22,11 @@ from typer.testing import CliRunner
 from rag_eval.cli import app
 from rag_eval.ingest.downloader import download_corpus
 from rag_eval.ingest.manifest import (
+    MIN_PDF_BYTES,
     CorpusDocument,
     ManifestError,
     PdfValidationError,
+    _unique_slug,
     load_corpus_config,
     render_corpus_yaml,
     scan_local_pdfs,
@@ -760,3 +762,154 @@ def test_render_corpus_yaml_round_trips_documents(tmp_path: Path) -> None:
 
     assert loaded.documents == [document]
     assert "fda-round-trip" in config.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def test_load_corpus_config_rejects_colliding_paths(tmp_path: Path) -> None:
+    config = write_corpus(
+        tmp_path,
+        [
+            {"doc_id": "fda-a", "title": "A", "local_filename": "fda-a.pdf"},
+            {"doc_id": "fda-b", "title": "B", "local_filename": "fda-a.pdf"},
+        ],
+    )
+
+    with pytest.raises(ManifestError, match="colliding local PDF filenames"):
+        load_corpus_config(config)
+
+
+def test_load_corpus_config_rejects_case_only_path_collision(tmp_path: Path) -> None:
+    config = write_corpus(
+        tmp_path,
+        [
+            {"doc_id": "fda-a", "title": "A", "local_filename": "Fda.pdf"},
+            {"doc_id": "fda-b", "title": "B", "local_filename": "fda.PDF"},
+        ],
+    )
+
+    with pytest.raises(ManifestError, match="colliding local PDF filenames"):
+        load_corpus_config(config)
+
+
+@pytest.mark.parametrize("version", [2, 0, True])
+def test_load_corpus_config_rejects_unsupported_schema_version(
+    tmp_path: Path, version: Any
+) -> None:
+    config = tmp_path / "corpus.yaml"
+    config.write_text(
+        yaml.safe_dump({"schema_version": version, "documents": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestError, match="schema_version"):
+        load_corpus_config(config)
+
+
+def test_load_corpus_config_wraps_unreadable_file(tmp_path: Path) -> None:
+    config = tmp_path / "corpus.yaml"
+    config.write_bytes(b"\xff\xfe\x00not valid utf-8")
+
+    with pytest.raises(ManifestError, match="cannot read corpus config"):
+        load_corpus_config(config)
+
+
+def test_unique_slug_stays_within_max_length() -> None:
+    base = "a" * 80
+    used: set[str] = {base}
+    for index in range(2, 1000):
+        suffix = f"-{index}"
+        stem = base[: 80 - len(suffix)].strip("-") or "document"
+        used.add(f"{stem}{suffix}")
+
+    slug = _unique_slug(base, used)
+
+    assert slug == "a" * 75 + "-1000"
+    assert len(slug) <= 80
+
+
+@pytest.mark.parametrize("status", [204, 304])
+def test_unexpected_status_is_reported(tmp_path: Path, status: int) -> None:
+    raw = tmp_path / "raw"
+    config = write_corpus(
+        tmp_path,
+        [
+            {
+                "doc_id": "fda-weird",
+                "title": "Weird",
+                "source_url": "https://example.invalid/w.pdf",
+            }
+        ],
+    )
+
+    summary = download_corpus(
+        config,
+        raw,
+        transport=transport(lambda request: httpx.Response(status)),
+        wait=lambda _: 0.0,
+    )
+
+    entry = summary.entries[0]
+    assert entry.status == "failed"
+    assert entry.error is not None
+    assert f"unexpected HTTP {status}" in entry.error
+    assert not list(raw.glob("*.tmp"))
+
+
+def test_pdf_at_minimum_size_is_accepted(tmp_path: Path) -> None:
+    path = tmp_path / "min.pdf"
+    payload = b"%PDF-1.4\n" + b"0" * (MIN_PDF_BYTES - len(b"%PDF-1.4\n"))
+    assert len(payload) == MIN_PDF_BYTES
+    path.write_bytes(payload)
+
+    digest, size = verify_pdf_file(path)
+
+    assert size == MIN_PDF_BYTES
+    assert len(digest) == 64
+
+
+def test_pdf_below_minimum_size_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "small.pdf"
+    payload = b"%PDF-1.4\n" + b"0" * (MIN_PDF_BYTES - len(b"%PDF-1.4\n") - 1)
+    assert len(payload) == MIN_PDF_BYTES - 1
+    path.write_bytes(payload)
+
+    with pytest.raises(PdfValidationError, match="only"):
+        verify_pdf_file(path)
+
+
+def test_download_corpus_passes_timeout_to_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = tmp_path / "raw"
+    config = write_corpus(
+        tmp_path,
+        [
+            {
+                "doc_id": "fda-timeout",
+                "title": "Timeout",
+                "source_url": "https://example.invalid/t.pdf",
+            }
+        ],
+    )
+    seen: dict[str, float] = {}
+    payload = make_pdf()
+
+    def fake_build_client(
+        *,
+        transport: httpx.BaseTransport | None = None,
+        timeout_s: float = 60.0,
+    ) -> httpx.Client:
+        seen["timeout_s"] = timeout_s
+        return httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=payload)
+            )
+        )
+
+    monkeypatch.setattr("rag_eval.ingest.downloader.build_client", fake_build_client)
+
+    download_corpus(config, raw, timeout_s=1.5)
+
+    assert seen["timeout_s"] == 1.5

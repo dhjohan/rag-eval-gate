@@ -17,7 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import yaml
@@ -177,20 +177,45 @@ class CorpusConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = 1
+    schema_version: Literal[1] = 1
     documents: list[CorpusDocument] = Field(default_factory=list)
 
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _supported_schema_version(cls, value: Any) -> Any:
+        # Pydantic's Literal[1] accepts True because bool is an int subclass.
+        if isinstance(value, bool) or value != 1:
+            raise ValueError("schema_version must be 1")
+        return value
+
     @model_validator(mode="after")
-    def _unique_doc_ids(self) -> CorpusConfig:
-        seen: set[str] = set()
-        duplicates: list[str] = []
+    def _unique_doc_ids_and_paths(self) -> CorpusConfig:
+        seen_ids: set[str] = set()
+        duplicate_ids: list[str] = []
+        seen_names: dict[str, str] = {}
+        path_collisions: list[str] = []
+
         for document in self.documents:
-            if document.doc_id in seen:
-                duplicates.append(document.doc_id)
-            seen.add(document.doc_id)
-        if duplicates:
-            listed = ", ".join(sorted(set(duplicates)))
+            if document.doc_id in seen_ids:
+                duplicate_ids.append(document.doc_id)
+            seen_ids.add(document.doc_id)
+
+            filename = document.local_filename or f"{document.doc_id}.pdf"
+            # Case-fold so `A.pdf` and `a.pdf` collide on every platform.
+            key = filename.casefold()
+            if key in seen_names:
+                path_collisions.append(
+                    f"{filename} ({seen_names[key]} vs {document.doc_id})"
+                )
+            else:
+                seen_names[key] = document.doc_id
+
+        if duplicate_ids:
+            listed = ", ".join(sorted(set(duplicate_ids)))
             raise ValueError(f"duplicate doc_id values: {listed}")
+        if path_collisions:
+            listed = "; ".join(path_collisions)
+            raise ValueError(f"colliding local PDF filenames: {listed}")
         return self
 
 
@@ -227,7 +252,12 @@ def load_corpus_config(path: str | Path | None = None) -> CorpusConfig:
         raise ManifestError(f"corpus config not found: {config_path}")
 
     try:
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        content = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ManifestError(f"cannot read corpus config {config_path}: {exc}") from exc
+
+    try:
+        raw = yaml.safe_load(content)
     except yaml.YAMLError as exc:
         raise ManifestError(f"invalid YAML in {config_path}: {exc}") from exc
     if raw is None:
@@ -310,11 +340,12 @@ def verify_pdf_file(
     if head != PDF_MAGIC:
         raise PdfValidationError(
             f"{target.name} is not a PDF: expected {PDF_MAGIC.decode()!r} magic bytes, "
-            f"got {head[:8]!r}. An HTML error page or WAF challenge was probably saved."
+            f"got {head!r}. An HTML error page or WAF challenge was probably saved."
         )
-    if size <= MIN_PDF_BYTES:
+    if size < MIN_PDF_BYTES:
         raise PdfValidationError(
-            f"{target.name} is only {size} bytes; a valid PDF must exceed {MIN_PDF_BYTES}."
+            f"{target.name} is only {size} bytes; a valid PDF must be at least "
+            f"{MIN_PDF_BYTES} bytes."
         )
 
     digest = sha256_file(target)
@@ -415,11 +446,14 @@ def scan_local_pdfs(raw_dir: str | Path, config_path: str | Path) -> ScanResult:
 def _unique_slug(base: str, used: set[str]) -> str:
     if base not in used:
         return base
-    stem = base[:76].strip("-") or "document"
     index = 2
-    while f"{stem}-{index}" in used:
+    while True:
+        suffix = f"-{index}"
+        stem = base[: 80 - len(suffix)].strip("-") or "document"
+        candidate = f"{stem}{suffix}"
+        if candidate not in used:
+            return candidate
         index += 1
-    return f"{stem}-{index}"
 
 
 def _humanise_title(stem: str) -> str:
