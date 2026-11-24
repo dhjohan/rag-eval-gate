@@ -9,13 +9,14 @@ import numpy as np
 import pytest
 
 from rag_eval.cache.sqlite_cache import SqliteCache
-from rag_eval.config import EmbeddingsConfig
+from rag_eval.config import EmbeddingProviderConfig, EmbeddingsConfig
 from rag_eval.providers.embeddings import (
     AllEmbeddingProvidersFailed,
     EmbeddingClient,
     EmbeddingError,
     GoogleEmbeddingBackend,
     JinaEmbeddingBackend,
+    _default_backend,
 )
 
 DIMS = 64
@@ -33,11 +34,21 @@ class RecordingBackend:
         self._fail = fail
         self._dims = dims
 
-    def embed(self, texts: Sequence[str], *, task_type: str | None) -> list[list[float]]:
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        task_type: str | None,
+        on_vector: Callable[[int, Sequence[float]], None] | None = None,
+    ) -> list[list[float]]:
         self.calls.append((list(texts), task_type))
         if self._fail:
             raise EmbeddingError("provider exploded")
-        return [unit_vector()[: self._dims] for _ in texts]
+        vectors = [unit_vector()[: self._dims] for _ in texts]
+        if on_vector is not None:
+            for position, vector in enumerate(vectors):
+                on_vector(position, vector)
+        return vectors
 
     @property
     def call_count(self) -> int:
@@ -113,10 +124,20 @@ def test_vectors_are_l2_normalised(
     cache: SqliteCache,
 ) -> None:
     class SkewedBackend(RecordingBackend):
-        def embed(self, texts: Sequence[str], *, task_type: str | None) -> list[list[float]]:
+        def embed(
+            self,
+            texts: Sequence[str],
+            *,
+            task_type: str | None,
+            on_vector: Callable[[int, Sequence[float]], None] | None = None,
+        ) -> list[list[float]]:
             vector = [0.0] * DIMS
             vector[0], vector[1] = 3.0, 4.0
-            return [list(vector) for _ in texts]
+            vectors = [list(vector) for _ in texts]
+            if on_vector is not None:
+                for position, item in enumerate(vectors):
+                    on_vector(position, item)
+            return vectors
 
     client = make_client(
         embeddings_config({"google": embedding_provider()}), cache, {"google": SkewedBackend()}
@@ -309,3 +330,95 @@ def test_jina_backend_surfaces_http_errors() -> None:
 
     with pytest.raises(EmbeddingError, match="429"):
         backend.embed(["alpha"], task_type=None)
+
+
+def test_jina_backend_wraps_non_json_success() -> None:
+    backend = JinaEmbeddingBackend(
+        api_key="secret",
+        model="jina-embeddings-v5-text-nano",
+        dims=DIMS,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text="<html>blocked</html>")
+        ),
+    )
+
+    with pytest.raises(EmbeddingError, match="invalid JSON"):
+        backend.embed(["alpha"], task_type=None)
+
+
+def test_duplicate_texts_are_embedded_once(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    backend = RecordingBackend()
+    client = single_client(embedding_provider(), embeddings_config, cache, backend)
+
+    result = client.embed_texts(["duplicate", "duplicate"])
+
+    assert backend.calls[-1][0] == ["duplicate"]
+    assert result.cache_misses == 2
+    np.testing.assert_allclose(result.vectors[0], result.vectors[1])
+
+
+class PerItemFlakyBackend:
+    """Fails on the second item of its first call, like a per-item SDK."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[str]] = []
+
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        task_type: str | None,
+        on_vector: Callable[[int, Sequence[float]], None] | None = None,
+    ) -> list[list[float]]:
+        self.batches.append(list(texts))
+        vectors: list[list[float]] = []
+        for position, _text in enumerate(texts):
+            if len(self.batches) == 1 and position == 1:
+                raise EmbeddingError("second item failed")
+            vector = unit_vector()
+            vectors.append(vector)
+            if on_vector is not None:
+                on_vector(position, vector)
+        return vectors
+
+
+def test_retry_reuses_backend_and_keeps_partial_progress(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    backend = PerItemFlakyBackend()
+    constructed: list[str] = []
+
+    def factory(name: str, cfg: Any, key: str) -> PerItemFlakyBackend:
+        constructed.append(name)
+        return backend
+
+    client = EmbeddingClient(
+        embeddings_config({"google": embedding_provider()}),
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=factory,
+        sleep=lambda _: None,
+    )
+
+    result = client.embed_texts(["alpha", "beta", "gamma"])
+
+    assert constructed == ["google"]  # one backend reused across the retry
+    assert backend.batches == [["alpha", "beta", "gamma"], ["beta", "gamma"]]
+    assert result.cache_misses == 3
+    assert result.vectors.shape == (3, DIMS)
+
+
+def test_google_backend_receives_configured_timeout(
+    embedding_provider: Callable[..., dict[str, Any]],
+) -> None:
+    cfg = EmbeddingProviderConfig.model_validate(embedding_provider(timeout_s=17))
+    backend = _default_backend("google", cfg, "key", None)
+
+    assert isinstance(backend, GoogleEmbeddingBackend)
+    assert backend.timeout_s == 17

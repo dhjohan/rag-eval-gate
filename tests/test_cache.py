@@ -37,7 +37,7 @@ def test_put_embedding_rejects_wrong_dimensions(cache: SqliteCache) -> None:
 
 def test_put_embedding_rejects_two_dimensional_input(cache: SqliteCache) -> None:
     with pytest.raises(ValueError, match="1-D"):
-        cache.put_embedding(sha256_text("x"), "model-a", 3, [[0.1, 0.2, 0.3]])
+        cache.put_embedding(sha256_text("x"), "model-a", 3, [[0.1, 0.2, 0.3]])  # type: ignore[list-item]
 
 
 def test_llm_response_roundtrip_preserves_actual_model(cache: SqliteCache) -> None:

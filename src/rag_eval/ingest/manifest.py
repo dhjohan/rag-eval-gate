@@ -13,6 +13,7 @@ import json
 import os
 import re
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -263,8 +264,12 @@ def write_corpus_config(path: str | Path, documents: Sequence[CorpusDocument]) -
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f"{target.name}.tmp")
-    tmp.write_text(render_corpus_yaml(documents), encoding="utf-8", newline="\n")
-    os.replace(tmp, target)
+    try:
+        tmp.write_text(render_corpus_yaml(documents), encoding="utf-8", newline="\n")
+        os.replace(tmp, target)
+    finally:
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
     return target
 
 
@@ -336,12 +341,16 @@ def write_manifest(
         "documents": [entry.model_dump(mode="json") for entry in entries],
     }
     tmp = target.with_name(f"{target.name}.tmp")
-    tmp.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    os.replace(tmp, target)
+    try:
+        tmp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        os.replace(tmp, target)
+    finally:
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
     return target
 
 
@@ -367,7 +376,10 @@ def scan_local_pdfs(raw_dir: str | Path, config_path: str | Path) -> ScanResult:
     added: list[str] = []
     skipped: list[tuple[str, str]] = []
 
-    for path in sorted(raw.glob("*.pdf")):
+    pdf_paths = sorted(
+        path for path in raw.iterdir() if path.is_file() and path.suffix.lower() == ".pdf"
+    )
+    for path in pdf_paths:
         if path.resolve() in tracked_paths:
             skipped.append((path.name, "already tracked"))
             continue

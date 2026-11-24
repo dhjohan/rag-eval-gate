@@ -22,8 +22,8 @@ metrics, or dashboards were implemented.
 | Embeddings | `src/rag_eval/providers/embeddings.py` | Gemini + Jina, cache-first, single vector space |
 | Rerank | `src/rag_eval/providers/rerank.py` | Jina reranker client |
 | CLI | `src/rag_eval/cli.py` | `doctor`, `cache-stats` |
-| CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard |
-| Tests | `tests/` | 96 offline tests |
+| CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard; mypy type check on push/PR |
+| Tests | `tests/` | 143 offline tests |
 
 ## Provider catalog verification (2026-11-22)
 
@@ -147,7 +147,31 @@ a local-first scanner that turns hand-downloaded PDFs into manifest entries.
 | Package exports | `src/rag_eval/ingest/__init__.py` | Public surface only |
 | CLI | `src/rag_eval/cli.py` | `corpus scan-local`, `corpus download`; Rich summary tables |
 | Tests | `tests/test_downloader.py` | 29 offline cases, `httpx.MockTransport` + `tmp_path` |
-| Dependencies | `pyproject.toml`, `uv.lock` | `rich` and `tenacity` promoted from transitive to direct |
+| Dependencies | `pyproject.toml`, `uv.lock` | `rich` and `tenacity` promoted from transitive to direct; `mypy` and `types-PyYAML` added as dev deps |
+
+## Code review fixes applied (post-Sprint 2A)
+
+The full code review (10 correctness, 3 efficiency, 4 style/tooling fixes) was applied to both Phase 0 and Sprint 2A:
+
+| # | Area | Fix |
+|---|------|-----|
+| C1 | `providers/embeddings.py` | Wrap `response.json()` / `item["embedding"]` in `EmbeddingError` so a non-JSON 200 triggers retry/fallback instead of crashing |
+| C2 | `providers/rerank.py` | Wrap `response.json()` / malformed payload in `RerankError` |
+| C3 | `ingest/manifest.py` | Case-insensitive PDF discovery (`iterdir()` + `suffix.lower() == ".pdf"`) so `.PDF` is found on Linux CI as well as Windows |
+| C4 | `providers/llm.py` | Include effective `cfg.max_tokens` / `cfg.reasoning_effort` in `prompt_hash` so config changes don't replay stale cache |
+| C5 | `providers/llm.py` | `_parse_structured` salvage via `json.JSONDecoder().raw_decode` (handles trailing prose braces) |
+| C6 | `providers/llm.py` | Release quota on 429 before retrying (one throttled call no longer burns N daily slots) |
+| C7 | `cache/sqlite_cache.py` | `try_consume_quota` is now a single atomic upsert guarded by `WHERE used < ?` |
+| C8 | `providers/embeddings.py` | Reuse one backend across retries; per-item `on_vector` callback caches partial progress on mid-batch failure |
+| C9 | `providers/embeddings.py` | Deduplicate duplicate texts within a batch before calling the backend |
+| C10 | `providers/llm.py` | Replace `\x3c`/`\x3e` regex with literal `<think>` / `</think>` tags |
+| E1 | `providers/embeddings.py` | Backend built once per provider call, reused across retries (no repeated TLS handshake) |
+| E2 | `providers/embeddings.py` | Duplicate batch inputs embedded once |
+| E3 | `ingest/downloader.py` | Lazy HTTP client (zero sockets on local-only runs); `%PDF-` checked on the first streamed chunk; hashed while streaming |
+| S1 | `ingest/manifest.py` | `try/finally` `.tmp` cleanup in `write_corpus_config` / `write_manifest` |
+| S2 | `providers/llm.py` | `google-genai` client created with configured `timeout_s` |
+| S3 | `tests/` | Moved `RecordingBackend` + `test_embedding_retry_after_transport_error` into `tests/test_embeddings.py`; deduped the copy in `test_llm_router.py` |
+| S4 | `ci.yml` | Added `mypy` type-check step; Python pinned to 3.12 |
 
 ## Design decisions worth remembering
 
@@ -185,7 +209,10 @@ $ python -m uv run ruff check src tests
 All checks passed!
 
 $ python -m uv run pytest -q
-125 passed in 1.57s
+143 passed in 1.58s
+
+$ python -m uv run mypy src tests
+# clean modulo pre-existing import-untyped stub notes
 ```
 
 Fully offline: every download path runs through `httpx.MockTransport`; the

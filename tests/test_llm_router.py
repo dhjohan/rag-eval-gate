@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import random
-from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from typing import Any
 
 import httpx
@@ -11,26 +12,8 @@ import pytest
 from pydantic import BaseModel
 
 from rag_eval.cache.sqlite_cache import SqliteCache
-from rag_eval.config import EmbeddingsConfig, LLMConfig
-from rag_eval.providers.embeddings import EmbeddingClient, EmbeddingError
+from rag_eval.config import LLMConfig
 from rag_eval.providers.llm import AllProvidersFailed, LLMRouter
-
-
-class RecordingBackend:
-    def __init__(self, *, fail: bool = False, dims: int = 64) -> None:
-        self.calls: list[tuple[list[str], str | None]] = []
-        self._fail = fail
-        self._dims = dims
-
-    def embed(self, texts: Sequence[str], *, task_type: str | None) -> list[list[float]]:
-        self.calls.append((list(texts), task_type))
-        if self._fail:
-            raise EmbeddingError("provider exploded")
-        return [[1.0] + [0.0] * (self._dims - 1) for _ in texts]
-
-    @property
-    def call_count(self) -> int:
-        return len(self.calls)
 
 
 class Verdict(BaseModel):
@@ -385,48 +368,9 @@ def test_think_tags_stripped_before_structured_parse(
     )
 
     assert result.provider_used == "a"
-    assert result.parsed is not None
+    assert isinstance(result.parsed, Verdict)
     assert result.parsed.score == 7
     assert result.parsed.reason == "ok"
-
-
-def test_embedding_retry_after_transport_error(
-    embedding_provider: Callable[..., dict[str, Any]],
-    embeddings_config: Callable[..., EmbeddingsConfig],
-    cache: SqliteCache,
-) -> None:
-    providers = {
-        "google": embedding_provider(base_url="https://g.test/v1"),
-    }
-    config = embeddings_config(providers, order=["google"], fallback=False)
-    backend = RecordingBackend(fail=True)
-
-    attempts = 0
-
-    def unit_vector() -> list[float]:
-        return [1.0] + [0.0] * 63
-
-    def flaky_embed(texts: Sequence[str], *, task_type: str | None) -> list[list[float]]:
-        nonlocal attempts
-        attempts += 1
-        if attempts < 2:
-            raise EmbeddingError("transient failure")
-        return [unit_vector() for _ in texts]
-
-    backend.embed = flaky_embed  # type: ignore[method-assign]
-    client = EmbeddingClient(
-        config,
-        cache,
-        api_key_resolver=lambda name: "secret",
-        backend_factory=lambda name, cfg, key: backend,
-        sleep=lambda _: None,
-    )
-
-    result = client.embed_texts(["alpha"])
-
-    assert attempts == 2
-    assert result.provider_used == "google"
-    assert result.cache_misses == 1
 
 
 def test_all_providers_failing_raises_with_reasons(
@@ -521,7 +465,7 @@ def test_invalid_json_falls_back_to_next_provider(
     result = router.generate([{"role": "user", "content": "judge"}], response_model=Verdict)
 
     assert result.provider_used == "b"
-    assert result.parsed is not None
+    assert isinstance(result.parsed, Verdict)
     assert result.parsed.score == 4
 
 
@@ -538,7 +482,7 @@ def test_json_inside_code_fence_is_parsed(
 
     result = router.generate([{"role": "user", "content": "judge"}], response_model=Verdict)
 
-    assert result.parsed is not None
+    assert isinstance(result.parsed, Verdict)
     assert result.parsed.score == 3
 
 
@@ -611,3 +555,136 @@ def test_extra_headers_are_sent(
     router.generate([{"role": "user", "content": "hi"}])
 
     assert calls[0].headers["x-title"] == "rag-eval-gate"
+
+
+def test_429_releases_quota_slot_for_retry(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    config = llm_config({"a": provider(rpd=1)})
+    today = datetime.now(UTC).date().isoformat()
+
+    def handler(request: httpx.Request, n: int) -> httpx.Response:
+        if n == 1:
+            return httpx.Response(429, json={"error": "slow down"})
+        return httpx.Response(200, json=ok_body())
+
+    router, calls = make_router(config, cache, handler)
+    result = router.generate([{"role": "user", "content": "hi"}])
+
+    assert result.provider_used == "a"
+    assert len(calls) == 2
+    # The throttled attempt returned its reservation, so the retry fits in a
+    # budget of one request per day.
+    assert cache.get_quota_used("a", today) == 1
+
+
+def test_retry_after_http_date_is_honoured(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    sleeps: list[float] = []
+    config = llm_config({"a": provider()}, backoff_cap_s=30.0)
+    header = format_datetime(datetime.now(UTC) + timedelta(seconds=5), usegmt=True)
+
+    def handler(request: httpx.Request, n: int) -> httpx.Response:
+        if n == 1:
+            return httpx.Response(429, headers={"retry-after": header})
+        return httpx.Response(200, json=ok_body())
+
+    router, calls = make_router(config, cache, handler, sleep=sleeps.append)
+    router.generate([{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 2
+    assert 3.0 <= sleeps[0] <= 6.0
+
+
+def test_retry_after_is_clamped_to_backoff_cap(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    sleeps: list[float] = []
+    config = llm_config({"a": provider()}, backoff_cap_s=5.0)
+
+    def handler(request: httpx.Request, n: int) -> httpx.Response:
+        if n == 1:
+            return httpx.Response(429, headers={"retry-after": "100"})
+        return httpx.Response(200, json=ok_body())
+
+    router, _calls = make_router(config, cache, handler, sleep=sleeps.append)
+    router.generate([{"role": "user", "content": "hi"}])
+
+    assert sleeps == [5.0]
+
+
+def test_prompt_hash_includes_effective_provider_defaults(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    router_a, _calls_a = make_router(
+        llm_config({"a": provider(max_tokens=16)}),
+        cache,
+        lambda req, n: httpx.Response(200, json=ok_body()),
+    )
+    router_b, calls_b = make_router(
+        llm_config({"a": provider(max_tokens=32)}),
+        cache,
+        lambda req, n: httpx.Response(200, json=ok_body()),
+    )
+
+    router_a.generate([{"role": "user", "content": "hi"}])
+    second = router_b.generate([{"role": "user", "content": "hi"}])
+
+    # Changing max_tokens in YAML must not replay the old cached answer.
+    assert second.cache_hit is False
+    assert len(calls_b) == 1
+
+
+def test_json_with_trailing_prose_brace_is_parsed(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    config = llm_config({"a": provider()})
+    content = 'Verdict: {"score": 4, "reason": "ok"} (note: {not json})'
+    router, _calls = make_router(
+        config, cache, lambda req, n: httpx.Response(200, json=ok_body(content=content))
+    )
+
+    result = router.generate([{"role": "user", "content": "judge"}], response_model=Verdict)
+
+    assert isinstance(result.parsed, Verdict)
+    assert result.parsed.score == 4
+
+
+class _Detail(BaseModel):
+    note: str
+
+
+class _StrictVerdict(BaseModel):
+    score: int
+    reason: str | None = None
+    detail: _Detail | None = None
+
+
+def test_strict_schema_closes_every_object(
+    provider: Callable[..., dict[str, Any]],
+    llm_config: Callable[..., LLMConfig],
+    cache: SqliteCache,
+) -> None:
+    config = llm_config({"a": provider()})
+    payload = ok_body(content='{"score": 1, "reason": "ok", "detail": {"note": "n"}}')
+    router, calls = make_router(config, cache, lambda req, n: httpx.Response(200, json=payload))
+
+    router.generate([{"role": "user", "content": "judge"}], response_model=_StrictVerdict)
+
+    schema = json.loads(calls[0].content)["response_format"]["json_schema"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"score", "reason", "detail"}
+    nested = schema["$defs"]["_Detail"]
+    assert nested["additionalProperties"] is False
+    assert nested["required"] == ["note"]
