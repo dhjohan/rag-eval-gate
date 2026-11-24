@@ -32,6 +32,10 @@ _JINA_TASKS = {
 class EmbeddingError(RuntimeError):
     """Raised when an embedding provider fails or returns unusable data."""
 
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
 
 class AllEmbeddingProvidersFailed(EmbeddingError):
     """Raised when no configured embedding provider could serve the request."""
@@ -179,10 +183,12 @@ class JinaEmbeddingBackend:
                 timeout=self.timeout_s,
             )
         except httpx.HTTPError as exc:
-            raise EmbeddingError(f"jina embedding transport error: {exc}") from exc
+            raise EmbeddingError(f"jina embedding transport error: {exc}", retryable=True) from exc
         if response.status_code >= 400:
+            retryable = response.status_code == 429 or response.status_code >= 500
             raise EmbeddingError(
-                f"jina embedding HTTP {response.status_code}: {response.text[:200]}"
+                f"jina embedding HTTP {response.status_code}: {response.text[:200]}",
+                retryable=retryable,
             )
         try:
             body = response.json()
@@ -244,7 +250,11 @@ class EmbeddingClient:
         task_type: str | None = None,
     ) -> EmbeddingResult:
         if not texts:
-            dims = self._config.providers[self._config.ordered_providers[0]].dims
+            dims = (
+                self._config.providers[self._config.ordered_providers[0]].dims
+                if self._config.ordered_providers
+                else 0
+            )
             return EmbeddingResult(
                 vectors=np.zeros((0, dims), dtype=np.float32),
                 provider_used="none",
@@ -315,7 +325,7 @@ class EmbeddingClient:
                             cached,
                         )
                     except EmbeddingError as exc:
-                        if attempt < self._max_retries:
+                        if exc.retryable and attempt < self._max_retries:
                             self._sleep(
                                 compute_backoff(
                                     attempt,
@@ -415,11 +425,16 @@ def _default_backend(
 
 
 def _normalise(vector: Sequence[float], dims: int) -> np.ndarray:
-    array = np.asarray(vector, dtype=np.float32)
+    try:
+        array = np.asarray(vector, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise EmbeddingError(f"embedding vector is not numeric: {exc}") from exc
     if array.ndim != 1:
         raise EmbeddingError(f"embedding must be 1-D, got shape {array.shape}")
     if array.size != dims:
         raise EmbeddingError(f"embedding has {array.size} dims, expected {dims}")
+    if not np.all(np.isfinite(array)):
+        raise EmbeddingError("embedding vector contains non-finite values")
     norm = float(np.linalg.norm(array))
     if norm == 0.0:
         raise EmbeddingError("embedding vector has zero norm")

@@ -17,6 +17,7 @@ from rag_eval.providers.embeddings import (
     GoogleEmbeddingBackend,
     JinaEmbeddingBackend,
     _default_backend,
+    _normalise,
 )
 
 DIMS = 64
@@ -422,3 +423,107 @@ def test_google_backend_receives_configured_timeout(
 
     assert isinstance(backend, GoogleEmbeddingBackend)
     assert backend.timeout_s == 17
+
+
+def test_normalise_rejects_non_numeric_vector() -> None:
+    with pytest.raises(EmbeddingError, match="not numeric"):
+        _normalise(["not", "a", "number"], 3)  # type: ignore
+
+
+def test_normalise_rejects_nan_and_inf() -> None:
+    with pytest.raises(EmbeddingError, match="non-finite"):
+        _normalise([float("nan"), 0.0, 0.0], 3)
+    with pytest.raises(EmbeddingError, match="non-finite"):
+        _normalise([float("inf"), 0.0, 0.0], 3)
+
+
+def test_normalise_rejects_wrong_shape() -> None:
+    with pytest.raises(EmbeddingError, match="1-D"):
+        _normalise([[0.1, 0.2]], 2)  # type: ignore[arg-type, list-item]
+    with pytest.raises(EmbeddingError, match="dims"):
+        _normalise([0.1, 0.2, 0.3], 2)
+
+
+def test_normalise_rejects_zero_norm() -> None:
+    with pytest.raises(EmbeddingError, match="zero norm"):
+        _normalise([0.0, 0.0, 0.0], 3)
+
+
+class PermanentFailureBackend:
+    """Always fails with a non-retryable error (e.g. bad API key)."""
+
+    call_count = 0
+
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        task_type: str | None,
+        on_vector: Callable[[int, Sequence[float]], None] | None = None,
+    ) -> list[list[float]]:
+        PermanentFailureBackend.call_count += 1
+        raise EmbeddingError("invalid API key", retryable=False)
+
+
+def test_non_retryable_error_fails_over_without_retry(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    PermanentFailureBackend.call_count = 0
+    providers = {
+        "google": embedding_provider(base_url="https://g.test/v1"),
+        "jina": embedding_provider(
+            base_url="https://j.test/v1", model="jina-embeddings-v5-text-nano"
+        ),
+    }
+    config = embeddings_config(providers, order=["google", "jina"], fallback=True)
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: PermanentFailureBackend(),
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(AllEmbeddingProvidersFailed, match="google"):
+        client.embed_texts(["alpha"])
+
+    # Each provider tried once; no retries on a non-retryable error.
+    assert PermanentFailureBackend.call_count == 2
+
+
+def test_retryable_429_is_retried_before_failing_over(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    attempts = 0
+
+    def flaky_embed(
+        texts: Sequence[str], *, task_type: str | None, on_vector=None
+    ) -> list[list[float]]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 2:
+            raise EmbeddingError("rate limited", retryable=True)
+        return [unit_vector() for _ in texts]
+
+    providers = {
+        "google": embedding_provider(base_url="https://g.test/v1"),
+    }
+    config = embeddings_config(providers, order=["google"], fallback=False)
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: type(
+            "F", (), {"embed": staticmethod(flaky_embed), "close": lambda self: None}
+        )(),
+        sleep=lambda _: None,
+    )
+
+    result = client.embed_texts(["alpha"])
+
+    assert attempts == 2
+    assert result.provider_used == "google"

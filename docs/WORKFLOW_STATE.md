@@ -23,7 +23,7 @@ metrics, or dashboards were implemented.
 | Rerank | `src/rag_eval/providers/rerank.py` | Jina reranker client |
 | CLI | `src/rag_eval/cli.py` | `doctor`, `cache-stats` |
 | CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard; mypy type check on push/PR |
-| Tests | `tests/` | 143 offline tests |
+| Tests | `tests/` | 155 offline tests |
 
 ## Provider catalog verification (2026-11-22)
 
@@ -173,6 +173,28 @@ The full code review (10 correctness, 3 efficiency, 4 style/tooling fixes) was a
 | S3 | `tests/` | Moved `RecordingBackend` + `test_embedding_retry_after_transport_error` into `tests/test_embeddings.py`; deduped the copy in `test_llm_router.py` |
 | S4 | `ci.yml` | Added `mypy` type-check step; Python pinned to 3.12 |
 
+## Follow-up `llm.py` review fixes
+
+A second, focused review of `providers/llm.py` found edge cases and one broken regex. All are fixed:
+
+| # | Area | Fix |
+|---|------|-----|
+| L1 | `_parse_structured` | **Critical:** the `<think>` regex was `r" thinking.*?</think>"` (space + "thinking"), so tags were never stripped. It is now `r"<think>.*?</think>"`, plus a stray-closing-tag rule for models that omit the opening tag |
+| L2 | `generate` | A cached entry that fails `_parse_structured` no longer aborts the probe; remaining providers' caches are checked before the network |
+| L3 | `_try_provider` | Latency now uses the injected `self._clock()` instead of `time.perf_counter()` |
+| L4 | `_strict_json_schema` | No longer rewrites `default` / `examples` / `const` / `enum` data, and preserves a schema-valued `additionalProperties` (free-form map field) |
+| L5 | `_extract_content` | Multipart chunks whose `text` is `None` are skipped instead of raising `TypeError` |
+| L6 | `_try_provider` | Non-object `usage` (`[]`, `"n/a"`, …) no longer raises `AttributeError` |
+| L7 | `_build_payload` | Schema instruction merges into an existing leading system message instead of creating two consecutive system turns |
+| L8 | `_try_provider` | `base_url.rstrip("/")` before joining `/chat/completions`; explicit 3xx handling (redirects fail over instead of being parsed as JSON) |
+| L9 | `generate` | Candidate order and prompt hashes are computed once per call, not twice |
+| L10 | `_try_provider` | `Retry-After` longer than `backoff_cap_s` now fails over immediately instead of sleeping and retrying a throttled endpoint |
+| L11 | `_prompt_hash` | Includes `cfg.structured_output`, so switching a provider from `none` to `json_schema` invalidates the cache |
+| L12 | `_parse_structured` | Fenced-code extraction now handles any language tag (e.g. `json5`) and unclosed fences |
+| L13 | `_error_snippet` | Slices the response body before splitting to avoid materialising a huge payload |
+
+Deliberately unchanged: 5xx responses still keep their quota slot. The provider saw and counted the request, and the existing test pins that decision. 429 / 401 / 403 / transport errors continue to release the slot.
+
 ## Design decisions worth remembering
 
 1. **Local-first is structural, not conditional.** `PdfDownloader.process`
@@ -209,7 +231,7 @@ $ python -m uv run ruff check src tests
 All checks passed!
 
 $ python -m uv run pytest -q
-143 passed in 1.58s
+155 passed in 1.53s
 
 $ python -m uv run mypy src tests
 # clean modulo pre-existing import-untyped stub notes
