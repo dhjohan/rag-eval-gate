@@ -1,7 +1,12 @@
-"""Corpus ingestion: manifest schema, local PDF scanning, and acquisition."""
+"""Corpus ingestion: manifest, acquisition, and canonical PDF parsing."""
 
 from __future__ import annotations
 
+from rag_eval.ingest.canonical_parser import (
+    CanonicalParseError,
+    parse_pdf,
+    write_canonical_document,
+)
 from rag_eval.ingest.downloader import (
     DownloadError,
     DownloadSummary,
@@ -31,6 +36,7 @@ from rag_eval.ingest.manifest import (
     write_corpus_config,
     write_manifest,
 )
+from rag_eval.ingest.models import CanonicalDocument, CanonicalPage
 
 __all__ = [
     "DEFAULT_CATEGORY",
@@ -39,6 +45,9 @@ __all__ = [
     "DEFAULT_RAW_DIR",
     "MIN_PDF_BYTES",
     "PDF_MAGIC",
+    "CanonicalDocument",
+    "CanonicalPage",
+    "CanonicalParseError",
     "CorpusConfig",
     "CorpusDocument",
     "DownloadError",
@@ -51,11 +60,13 @@ __all__ = [
     "build_client",
     "download_corpus",
     "load_corpus_config",
+    "parse_pdf",
     "render_corpus_yaml",
     "scan_local_pdfs",
     "sha256_file",
     "slugify",
     "verify_pdf_file",
+    "write_canonical_document",
     "write_corpus_config",
     "write_manifest",
 ]

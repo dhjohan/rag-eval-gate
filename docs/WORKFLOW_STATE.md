@@ -23,7 +23,7 @@ metrics, or dashboards were implemented.
 | Rerank | `src/rag_eval/providers/rerank.py` | Jina reranker client |
 | CLI | `src/rag_eval/cli.py` | `doctor`, `cache-stats` |
 | CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard; mypy type check on push/PR |
-| Tests | `tests/` | 187 offline tests |
+| Tests | `tests/` | 203 offline tests |
 
 ## Provider catalog verification (2026-11-22)
 
@@ -291,15 +291,76 @@ pinned SHA-256 and byte count. The entries have `local_filename` but no
 `source_url` (the files were fetched by hand), so the corpus is local state and
 `data/raw/` remains git-ignored.
 
+## Phase 1 — Sprint 2B: canonical PDF parser: COMPLETE
+
+Status date: 2026-11-24
+
+Scope was parsing only: turn a verified PDF into a canonical JSON document with
+exact page-to-character offsets. No chunking, vector index, retrieval, metrics,
+or golden QA was started.
+
+### Delivered
+
+| Area | File | Notes |
+| --- | --- | --- |
+| Models | `src/rag_eval/ingest/models.py` | `CanonicalPage`, `CanonicalDocument`; frozen, `extra="forbid"`; strict offset/table/page invariants |
+| Parser | `src/rag_eval/ingest/canonical_parser.py` | pymupdf line extraction + pdfplumber tables, coordinate alignment, header/footer removal, band-segmented ordering, atomic JSON |
+| CLI | `src/rag_eval/cli.py` | `corpus parse`, `corpus stats` |
+| Tests | `tests/test_canonical_parser.py` | 16 offline synthetic-PDF tests |
+| Dependencies | `pyproject.toml`, `uv.lock` | `pymupdf>=1.24,<2`, `pdfplumber`, `tiktoken`; mypy overrides for untyped PDF libs |
+
+### Design decisions
+
+1. **Pure-CPU pin.** `pymupdf` 2.x pulls `pymupdf-layout` + `onnxruntime`; the
+   project pins `pymupdf>=1.24,<2` (1.28.x) so no ML runtime is installed. The
+   banned-dependency guard stays green.
+2. **Coordinate alignment.** pymupdf text coordinates are unrotated and
+   CropBox-relative; pdfplumber table boxes are MediaBox-scoped (rotated when the
+   page is). The parser scales to MediaBox units, derotates (90/180/270), then
+   subtracts the CropBox origin.
+3. **Table exclusion is line-level.** A line is dropped when its centre is inside
+   a validated table or > 50% of its area overlaps one. Captions below a table are
+   preserved; cell text is never duplicated as prose.
+4. **Only real tables become Markdown.** 1×1 callouts, empty tables, and sparse
+   page-border rectangles are rejected. Cells are sanitized (`None -> ""`,
+   whitespace collapsed, `|` escaped).
+5. **Reading order is band-segmented.** A gutter is accepted only when at least
+   two items sit on each side and their y-intervals overlap, so indented
+   1-column lists are not split. Full-width items (titles, spanning tables)
+   separate bands; within a band the left column is read before the right.
+6. **Offsets are exact by construction.** Page texts are joined with `"\n\n"`
+   and each page stores `full_text[start:end]`; the model validator rejects any
+   document where the slice does not reproduce the page text.
+7. **Token counting is injectable.** Tests pass an offline counter; the default
+   `cl100k_base` tiktoken counter is constructed lazily and is only used by the
+   CLI.
+
+### Verification evidence
+
+```
+$ python -m uv run ruff check src tests
+All checks passed!
+
+$ python -m uv run mypy src tests
+Success: no issues found in 25 source files
+
+$ python -m uv run pytest -q
+203 passed in 2.15s
+```
+
+All tests are offline: synthetic PDFs are written to `tmp_path` with pymupdf and
+token counting is injected. The real 21-document corpus was **not** parsed in the
+agent loop; the operator runs `rag-eval corpus parse && rag-eval corpus stats`.
+
 ## Not done (deliberately)
 
-- No PDF parsing, text extraction, chunking, index building, or metrics.
+- No chunking, vector index, retrieval metrics, or golden QA yet.
 - No `source_url` values were invented; the manual corpus is pinned by SHA-256
   instead. Document URLs can be added later if reproducible downloads are needed.
 - No live retrieval or eval has run yet.
 
 ## Next phase
 
-Sprint 2B should start with canonical document parsing and the citation-invariant
-`(doc_id, page_num, evidence_quote, start_char, end_char)` contract, and must not
-touch retrieval metrics until the golden QA schema exists.
+Sprint 2C should build chunking over `data/processed/docs/*.json` while
+preserving `(doc_id, page_num, start_char, end_char)` provenance, then the
+retrieval layer. Metrics must not start until the golden QA schema exists.
