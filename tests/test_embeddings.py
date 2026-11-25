@@ -737,7 +737,7 @@ def test_backend_max_batch_sizes() -> None:
 
     try:
         assert google.max_batch_size == 1
-        assert jina.max_batch_size == 64
+        assert jina.max_batch_size == 32
     finally:
         jina.close()
 
@@ -811,3 +811,156 @@ def test_retry_resends_only_the_failed_sub_batch(
     assert result.vectors.shape == (4, DIMS)
     for text in ("a", "b", "c", "d"):
         assert cache.get_embedding(sha256_text(text), model_id, cfg.dims) is not None
+
+
+# -- token-per-minute pacing ------------------------------------------------
+
+
+class _FakeClock:
+    """Clock whose ``sleep`` advances time, so pacing tests never wait."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _tpm_client(
+    config: EmbeddingsConfig,
+    cache: SqliteCache,
+    backend: RecordingBackend,
+    clock: _FakeClock,
+) -> EmbeddingClient:
+    return EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: backend,
+        sleep=clock.sleep,
+        clock=clock,
+    )
+
+
+def test_tpm_pacing_tiny_query_does_not_wait(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    provider_cfg = embedding_provider(tpm=60000)
+    config = embeddings_config({"google": provider_cfg})
+    clock = _FakeClock()
+    backend = _SplitBackend(max_batch=1024)
+    client = _tpm_client(config, cache, backend, clock)
+
+    client.embed_texts(["hi"])
+
+    # A ~1-token query must not sleep at all.
+    assert clock.now == 0.0
+
+
+def test_tpm_pacing_large_batches_wait_proportionally(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    provider_cfg = embedding_provider(tpm=60000)  # 1000 tokens/s, burst 7500
+    config = embeddings_config({"google": provider_cfg})
+    clock = _FakeClock()
+    backend = _SplitBackend(max_batch=1024)
+    client = _tpm_client(config, cache, backend, clock)
+
+    # ~9000 estimated tokens: the first fills the 7500-token burst instantly,
+    # the second must wait 7500 / 1000 = 7.5s.
+    client.embed_texts(["x" * 27000])
+    assert clock.now == 0.0
+    client.embed_texts(["y" * 27000])
+
+    assert clock.now == pytest.approx(7.5, abs=0.1)
+
+
+def test_tpm_429_uses_full_cooldown(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                text='{"detail":"Token rate limit exceeded: 107,251/100,000 tokens per minute."}',
+            )
+        return httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": unit_vector()}]}
+        )
+
+    backend = JinaEmbeddingBackend(
+        api_key="secret",
+        model="jina-embeddings-v5-text-nano",
+        dims=DIMS,
+        transport=httpx.MockTransport(handler),
+    )
+    provider_cfg = embedding_provider(model="jina-embeddings-v5-text-nano")
+    config = embeddings_config({"jina": provider_cfg}, order=["jina"])
+    sleeps: list[float] = []
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: backend,
+        sleep=sleeps.append,
+        max_retries=2,
+    )
+
+    result = client.embed_texts(["alpha"])
+
+    assert attempts == 2
+    assert sleeps == [62.0]
+    assert result.vectors.shape == (1, DIMS)
+
+
+def test_429_honours_retry_after_header(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"retry-after": "5"}, text="slow down")
+        return httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": unit_vector()}]}
+        )
+
+    backend = JinaEmbeddingBackend(
+        api_key="secret",
+        model="jina-embeddings-v5-text-nano",
+        dims=DIMS,
+        transport=httpx.MockTransport(handler),
+    )
+    provider_cfg = embedding_provider(model="jina-embeddings-v5-text-nano")
+    config = embeddings_config({"jina": provider_cfg}, order=["jina"])
+    sleeps: list[float] = []
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: backend,
+        sleep=sleeps.append,
+        max_retries=2,
+    )
+
+    client.embed_texts(["alpha"])
+
+    assert attempts == 2
+    assert sleeps == [5.0]

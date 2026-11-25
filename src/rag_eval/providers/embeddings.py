@@ -18,7 +18,12 @@ import numpy as np
 
 from rag_eval.cache.sqlite_cache import SqliteCache, sha256_text
 from rag_eval.config import EmbeddingProviderConfig, EmbeddingsConfig, resolve_api_key
-from rag_eval.providers.rate_limit import compute_backoff
+from rag_eval.providers.rate_limit import (
+    TokenBucket,
+    TokenBucketTPM,
+    compute_backoff,
+    parse_retry_after,
+)
 
 _JINA_TASKS = {
     "RETRIEVAL_DOCUMENT": "retrieval.passage",
@@ -32,9 +37,17 @@ _JINA_TASKS = {
 class EmbeddingError(RuntimeError):
     """Raised when an embedding provider fails or returns unusable data."""
 
-    def __init__(self, message: str, *, retryable: bool = True) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        # Set when the provider tells us how long to wait (e.g. TPM 429).
+        self.retry_after = retry_after
 
 
 class AllEmbeddingProvidersFailed(EmbeddingError):
@@ -165,9 +178,9 @@ class JinaEmbeddingBackend:
 
     @property
     def max_batch_size(self) -> int:
-        # 64 chunks * ~450 tokens stays ~22k-28k tokens per request, safely
-        # under Jina Free Tier's 100k TPM and well below the 1024-item cap.
-        return 64
+        # 32 chunks * ~450 tokens stays ~11k-14k tokens per request, under
+        # Jina Free Tier's 100k TPM and well below the 1024-item cap.
+        return 32
 
     def close(self) -> None:
         if self._owns_client:
@@ -202,9 +215,20 @@ class JinaEmbeddingBackend:
             raise EmbeddingError(f"jina embedding transport error: {exc}", retryable=True) from exc
         if response.status_code >= 400:
             retryable = response.status_code == 429 or response.status_code >= 500
+            retry_after: float | None = None
+            if response.status_code == 429:
+                retry_after = parse_retry_after(response.headers.get("retry-after"))
+                body = response.text.lower()
+                if retry_after is None and (
+                    "token rate limit" in body or "tokens per minute" in body
+                ):
+                    # A TPM 429 needs a full window to clear; retrying in a few
+                    # seconds would just burn the remaining attempts.
+                    retry_after = 62.0
             raise EmbeddingError(
                 f"jina embedding HTTP {response.status_code}: {response.text[:200]}",
                 retryable=retryable,
+                retry_after=retry_after,
             )
         try:
             body = response.json()
@@ -245,6 +269,7 @@ class EmbeddingClient:
         backoff_base_s: float = 1.0,
         backoff_cap_s: float = 30.0,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
         rng: random.Random | None = None,
     ) -> None:
         self._config = config
@@ -257,7 +282,34 @@ class EmbeddingClient:
         self._backoff_base_s = backoff_base_s
         self._backoff_cap_s = backoff_cap_s
         self._sleep = sleep
+        self._clock = clock
         self._rng = rng or random.Random(0)
+        # Per-provider pacing buckets, created lazily from the provider config.
+        self._rpm_buckets: dict[str, TokenBucket] = {}
+        self._tpm_buckets: dict[str, TokenBucketTPM] = {}
+
+    def _pace(
+        self, provider: str, cfg: EmbeddingProviderConfig, texts: Sequence[str]
+    ) -> None:
+        """Wait if sending ``texts`` would exceed the provider's RPM/TPM budget."""
+        if cfg.rpm is not None:
+            rpm_bucket = self._rpm_buckets.get(provider)
+            if rpm_bucket is None:
+                rpm_bucket = TokenBucket(
+                    cfg.rpm, clock=self._clock, sleep=self._sleep
+                )
+                self._rpm_buckets[provider] = rpm_bucket
+            rpm_bucket.acquire(1.0)
+        if cfg.tpm is not None:
+            tpm_bucket = self._tpm_buckets.get(provider)
+            if tpm_bucket is None:
+                tpm_bucket = TokenBucketTPM(
+                    cfg.tpm, clock=self._clock, sleep=self._sleep
+                )
+                self._tpm_buckets[provider] = tpm_bucket
+            # Conservative estimate: ~3 characters per token.
+            estimated = sum(max(1, len(text) // 3) for text in texts)
+            tpm_bucket.acquire(float(estimated))
 
     def embed_texts(
         self,
@@ -332,6 +384,7 @@ class EmbeddingClient:
                             batch.append(index)
                     try:
                         self._embed_batch(
+                            name,
                             backend,
                             cfg,
                             model_id,
@@ -344,14 +397,19 @@ class EmbeddingClient:
                         )
                     except EmbeddingError as exc:
                         if exc.retryable and attempt < self._max_retries:
-                            self._sleep(
-                                compute_backoff(
+                            # Honour a provider cooldown (e.g. a TPM 429) instead
+                            # of the short exponential backoff, which would burn
+                            # every retry inside the still-blocked window.
+                            if exc.retry_after is not None:
+                                delay = exc.retry_after
+                            else:
+                                delay = compute_backoff(
                                     attempt,
                                     base_s=self._backoff_base_s,
                                     cap_s=self._backoff_cap_s,
                                     rng=self._rng,
                                 )
-                            )
+                            self._sleep(delay)
                             continue
                         failures.append(f"{name}: {exc}")
                         break
@@ -381,6 +439,7 @@ class EmbeddingClient:
 
     def _embed_batch(
         self,
+        provider_name: str,
         backend: EmbeddingBackend,
         cfg: EmbeddingProviderConfig,
         model_id: str,
@@ -396,7 +455,8 @@ class EmbeddingClient:
         The batch is a list of indices into ``texts`` (it may be sparse when
         only some cache entries were missing). It is split into sub-batches no
         larger than ``backend.max_batch_size`` so providers with per-request
-        item caps (e.g. Jina) never reject the whole batch.
+        item caps (e.g. Jina) never reject the whole batch. Each sub-batch is
+        paced against the provider's RPM/TPM budget before it is sent.
         """
 
         max_batch = backend.max_batch_size
@@ -416,6 +476,7 @@ class EmbeddingClient:
         for offset in range(0, len(batch), max_batch):
             sub_batch = batch[offset : offset + max_batch]
             sub_texts = [texts[index] for index in sub_batch]
+            self._pace(provider_name, cfg, sub_texts)
 
             def on_vector(
                 position: int, vector: Sequence[float], *, _sub=sub_batch

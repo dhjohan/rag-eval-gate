@@ -90,6 +90,72 @@ class TokenBucket:
         return wait_s
 
 
+class TokenBucketTPM:
+    """Token bucket that paces *token* consumption, not request count.
+
+    Embedding endpoints enforce tokens-per-minute, so a request-count bucket is
+    not enough: a few large sub-batches can blow the TPM budget even at low RPM.
+    The burst capacity is deliberately small (<= 25k) so back-to-back requests
+    cannot dump a full minute's budget at ``t=0``.
+    """
+
+    def __init__(
+        self,
+        tpm: int,
+        *,
+        max_burst_tokens: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if tpm <= 0:
+            raise ValueError("tpm must be positive")
+        self.rate_per_second = tpm / 60.0
+        # Keep the initial burst to ~1/8 of the minute budget (<= 25k), so the
+        # first minute can never exceed burst + tpm (~90k for an 80k budget).
+        burst_cap = max_burst_tokens if max_burst_tokens is not None else 25_000
+        self.capacity = float(max(1, min(burst_cap, tpm // 8)))
+        self._tokens = self.capacity
+        self._clock = clock
+        self._sleep = sleep
+        self._last = clock()
+        self._lock = threading.Lock()
+
+    @property
+    def tokens(self) -> float:
+        with self._lock:
+            return self._tokens
+
+    def _refill_locked(self) -> None:
+        now = self._clock()
+        if now <= self._last:
+            return
+        elapsed = now - self._last
+        self._tokens = min(self.capacity, self._tokens + elapsed * self.rate_per_second)
+        self._last = now
+
+    def acquire(self, tokens: float = 1.0) -> float:
+        """Block until ``tokens`` are available; return the seconds waited."""
+        if tokens <= 0:
+            raise ValueError("tokens must be positive")
+        # A single request larger than the burst still goes out, but it drains
+        # the bucket; subsequent requests then pay the difference.
+        request = min(float(tokens), self.capacity)
+        with self._lock:
+            self._refill_locked()
+            if self._tokens >= request:
+                self._tokens -= request
+                return 0.0
+            deficit = request - self._tokens
+            wait_s = min(deficit / self.rate_per_second, 62.0)
+            self._tokens = min(
+                self.capacity, self._tokens + wait_s * self.rate_per_second
+            )
+            self._tokens = max(0.0, self._tokens - request)
+            self._last = max(self._clock(), self._last + wait_s)
+        self._sleep(wait_s)
+        return wait_s
+
+
 class DailyQuota:
     """Persisted per-provider daily request budget."""
 
