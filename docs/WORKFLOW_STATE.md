@@ -309,6 +309,22 @@ Re-parsed corpus: **24 documents, 788 pages, 2,139,372 characters, 203 tables,
 strategies (`fixed_token`, `structure_aware`, `contextual_heading`) were rebuilt
 against that digest.
 
+### Corpus update (2026-11-25, later): 28 documents
+
+Four more PDFs were added to `data/raw/` and registered with
+`rag-eval corpus scan-local` (`4 added, 24 skipped`), then re-verified with
+`rag-eval corpus download` (`total 28  ok 28  failed 0`):
+
+- `fda-applying-human-factors-and-usability-engineering`
+- `fda-cade-510k-guidance`
+- `fda-electronic-product-user-manuals-guidance`
+- `rfw-technology-in-medical-devices`
+
+Re-parsed corpus: **28 documents, 891 pages, 2,390,910 characters, 212 tables,
+487,776 tokens**, `corpus_digest = 8bac41540940deba…`. Indexes rebuilt:
+`fixed_token` 1,097 chunks; `structure_aware` and `contextual_heading` 1,952
+chunks each; every index carries all 28 `doc_id`s.
+
 ## Phase 1 — Sprint 2B: canonical PDF parser: COMPLETE
 
 Status date: 2026-11-24

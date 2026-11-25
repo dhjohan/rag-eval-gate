@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from datetime import date
 from pathlib import Path
@@ -30,6 +31,7 @@ from rag_eval.ingest.manifest import (
     load_corpus_config,
     render_corpus_yaml,
     scan_local_pdfs,
+    slugify,
     verify_pdf_file,
     write_corpus_config,
     write_manifest,
@@ -747,6 +749,16 @@ def test_shipped_corpus_config_is_in_canonical_form() -> None:
     normalized = shipped.read_text(encoding="utf-8").replace("\r\n", "\n")
     loaded = load_corpus_config(shipped)
     assert normalized == render_corpus_yaml(loaded.documents)
+
+
+def test_shipped_corpus_doc_ids_follow_their_filenames() -> None:
+    """A hand-edited doc_id must not drift away from the PDF it points at."""
+    shipped = Path(__file__).resolve().parents[1] / "configs" / "corpus.yaml"
+    for document in load_corpus_config(shipped).documents:
+        assert document.local_filename is not None, document.doc_id
+        base = slugify(Path(document.local_filename).stem)
+        # scan-local only appends -2, -3, ... when two PDF stems slugify alike.
+        assert re.fullmatch(rf"{re.escape(base)}(?:-\d+)?", document.doc_id), document.doc_id
 
 
 def test_render_corpus_yaml_round_trips_documents(tmp_path: Path) -> None:
