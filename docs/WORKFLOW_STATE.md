@@ -318,12 +318,19 @@ Four more PDFs were added to `data/raw/` and registered with
 - `fda-applying-human-factors-and-usability-engineering`
 - `fda-cade-510k-guidance`
 - `fda-electronic-product-user-manuals-guidance`
-- `rfw-technology-in-medical-devices`
+- `fda-rfw-technology-in-medical-devices`
 
 Re-parsed corpus: **28 documents, 891 pages, 2,390,910 characters, 212 tables,
 487,776 tokens**, `corpus_digest = 8bac41540940deba…`. Indexes rebuilt:
 `fixed_token` 1,097 chunks; `structure_aware` and `contextual_heading` 1,952
 chunks each; every index carries all 28 `doc_id`s.
+
+`RFW-Technology-in-Medical-Devices.pdf` was then renamed to
+`FDA-RFW-Technology-in-Medical-Devices.pdf` (identical SHA-256), so its
+`doc_id`/`title` moved to `fda-rfw-technology-in-medical-devices` /
+`FDA RFW Technology in Medical Devices` and every entry now follows the
+`fda-*` convention. Re-parse gave `corpus_digest = d73e718ceee8e556…`; the three
+indexes were rebuilt again with identical chunk counts (1,097 / 1,952 / 1,952).
 
 ## Phase 1 — Sprint 2B: canonical PDF parser: COMPLETE
 

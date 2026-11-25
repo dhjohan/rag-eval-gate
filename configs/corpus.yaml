@@ -172,8 +172,8 @@ documents:
   category: fda_digital_health
   local_filename: FDA-Electronic-Product-User-Manuals-Guidance.pdf
   expected_sha256: 127c81c5ab2168c88e32d493de38be015a35e43ac67b85c4808110e6c0427ef8
-- doc_id: rfw-technology-in-medical-devices
-  title: RFW Technology in Medical Devices
+- doc_id: fda-rfw-technology-in-medical-devices
+  title: FDA RFW Technology in Medical Devices
   category: fda_digital_health
-  local_filename: RFW-Technology-in-Medical-Devices.pdf
+  local_filename: FDA-RFW-Technology-in-Medical-Devices.pdf
   expected_sha256: 1ce44482ab855ae608af2ab3875a668af9cb7531b7b4b81a060b4f65944cba23
