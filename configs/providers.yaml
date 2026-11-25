@@ -112,6 +112,8 @@ embeddings:
       dims: 768
       task_type: RETRIEVAL_DOCUMENT
       timeout_s: 60
+      rpm: 90 # short search queries stay instant
+      tpm: 80000 # safe margin under the free-tier 100,000 TPM
 
 rerank:
   enabled: true

@@ -23,7 +23,7 @@ metrics, or dashboards were implemented.
 | Rerank | `src/rag_eval/providers/rerank.py` | Jina reranker client |
 | CLI | `src/rag_eval/cli.py` | `doctor`, `cache-stats` |
 | CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard; mypy type check on push/PR |
-| Tests | `tests/` | 262 offline tests |
+| Tests | `tests/` | 266 offline tests |
 
 ## Provider catalog verification (2026-11-22)
 
@@ -451,12 +451,17 @@ integration, generator, or evaluation metrics/runners were started.
    SHA-256 over the chunking parameters plus provider/model/dims (and
    `hard_max_table_tokens`), so a changed config cannot silently reuse a
    stale index.
-7. **Batched embedding with provider caps.** All chunk `index_text` values go
-   to the existing `EmbeddingClient` (cache-first, `task_type` supplied by the
-   provider config, not hardcoded). The client splits the missing-vector batch
-   into sub-batches no larger than `backend.max_batch_size` (Jina: 64, Gemini:
-   1), so a large corpus never trips Jina's per-request item cap; partial
-   progress from earlier sub-batches is cached even if a later one fails.
+7. **Batched embedding with provider caps and TPM pacing.** All chunk
+   `index_text` values go to the existing `EmbeddingClient` (cache-first,
+   `task_type` supplied by the provider config, not hardcoded). The client
+   splits the missing-vector batch into sub-batches no larger than
+   `backend.max_batch_size` (Jina: 32, Gemini: 1), so a large corpus never
+   trips Jina's per-request item cap; partial progress from earlier sub-batches
+   is cached even if a later one fails. When the provider declares `tpm`, each
+   sub-batch is paced by a `TokenBucketTPM` (burst ≤ 25k, ~1/8 of the budget)
+   using a conservative `len(text) // 3` estimate; `rpm` adds a request-count
+   bucket. A 429 whose body mentions a token/minute limit (or carries
+   `Retry-After`) triggers a full ~62s cooldown instead of the short backoff.
    Vectors are re-normalised with `np.maximum(norm, 1e-12)`.
 8. **Atomic publish.** Artifacts are staged in a temp sibling directory and
    renamed into place; `vectors.npy` is written through an open file handle so
@@ -472,7 +477,7 @@ $ python -m uv run mypy src tests
 Success: no issues found in 37 source files
 
 $ python -m uv run pytest -q
-262 passed
+266 passed
 ```
 
 Fully offline: chunking tests inject `OfflineTokenizer` and a fake embedder;

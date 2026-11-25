@@ -180,6 +180,12 @@ class EmbeddingProviderConfig(_HttpProvider):
     model: str = Field(min_length=1)
     dims: int = Field(default=768, ge=64, le=3072)
     task_type: str | None = None
+    rpm: int | None = Field(
+        default=None, ge=1, description="Requests-per-minute budget for this provider"
+    )
+    tpm: int | None = Field(
+        default=None, ge=1, description="Tokens-per-minute budget for this provider"
+    )
 
 
 class EmbeddingsConfig(_StrictModel):
