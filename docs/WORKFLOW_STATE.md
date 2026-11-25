@@ -291,6 +291,24 @@ pinned SHA-256 and byte count. The entries have `local_filename` but no
 `source_url` (the files were fetched by hand), so the corpus is local state and
 `data/raw/` remains git-ignored.
 
+### Corpus update (2026-11-25): 24 documents, `fda-*` ids
+
+Three more PDFs were added and every file was renamed to a self-describing
+`FDA-*.pdf` name. `configs/corpus.yaml` was rewritten with
+`write_corpus_config()` so each `doc_id` and `title` comes from its filename stem
+(`slugify()` + `_humanise_title()`), and `rag-eval corpus download` re-verified
+the set:
+
+```
+total 24  ok 24  failed 0
+OK    corpus is ready
+```
+
+Re-parsed corpus: **24 documents, 788 pages, 2,139,372 characters, 203 tables,
+438,162 tokens**, `corpus_digest = 44dd1f3c02531656…`. All three chunk
+strategies (`fixed_token`, `structure_aware`, `contextual_heading`) were rebuilt
+against that digest.
+
 ## Phase 1 — Sprint 2B: canonical PDF parser: COMPLETE
 
 Status date: 2026-11-24
