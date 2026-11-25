@@ -23,7 +23,7 @@ metrics, or dashboards were implemented.
 | Rerank | `src/rag_eval/providers/rerank.py` | Jina reranker client |
 | CLI | `src/rag_eval/cli.py` | `doctor`, `cache-stats` |
 | CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard; mypy type check on push/PR |
-| Tests | `tests/` | 227 offline tests |
+| Tests | `tests/` | 254 offline tests |
 
 ## Provider catalog verification (2026-11-22)
 
@@ -409,14 +409,92 @@ $ python -m uv run pytest -q
 
 Tests are fully offline: canonical documents are built in memory / `tmp_path`.
 
+## Phase 3 — Sprint 3B-1: offset-invariant chunkers + hybrid index: COMPLETE
+
+Status date: 2026-11-25
+
+Scope was chunking and local index construction only. No retriever, reranker
+integration, generator, or evaluation metrics/runners were started.
+
+### Delivered
+
+| Area | File | Notes |
+| --- | --- | --- |
+| Models | `src/rag_eval/pipeline/models.py` | `ChunkConfig`, `Chunk`, `IndexManifest`; frozen, `extra="forbid"` |
+| Tokenizer | `src/rag_eval/pipeline/tokenizer.py` | Lazy `cl100k_base` with linear byte→char mapping; deterministic `OfflineTokenizer` for tests |
+| Chunkers | `src/rag_eval/pipeline/chunkers.py` | C1 fixed token, C2 structure aware, C3 contextual heading |
+| Index builder | `src/rag_eval/pipeline/index.py` | Chunk → embed → SQLite FTS5 + `vectors.npy` + manifest, atomic directory publish |
+| CLI | `src/rag_eval/cli.py` | `index build`, `index info` |
+| Tests | `tests/test_chunkers_and_index.py` | 27 offline cases |
+
+### Design decisions
+
+1. **One hard invariant everywhere.** Every chunk satisfies
+   `document.full_text[start_char:end_char] == raw_text`. C2 and C3 share a
+   single structural pass, so their spans and `raw_text` are identical.
+2. **Byte→char mapping, not decoding.** C1 walks the tokenizer's per-token
+   character spans. `TiktokenTokenizer` maps cumulative UTF-8 byte lengths from
+   `decode_tokens_bytes` to codepoint boundaries (floor the start, ceil the
+   end) in one linear pass, so a token that splits a multi-byte character still
+   yields whole-codepoint slices.
+3. **FDA-aware headings.** `section_path` recognises Markdown headings
+   (`#` … `######`) and numbered regulatory headings (`I.`, `1.2`,
+   `IV.A.2`), keyed by a capitalised title word to avoid false positives.
+   Everything before the first heading is `Preamble`.
+4. **Oversized tables split on rows.** A table over `hard_max_table_tokens`
+   splits at line boundaries; part 0 keeps the header in `raw_text`, later
+   parts repeat it only in `index_text`. C3 wraps that with the
+   `[Document: … | Section: …]` prefix (with `| Effective: …` only when set).
+5. **Page spans use interval intersection** (`page.start_char < end and
+   page.end_char > start`), so the `"\n\n"` gaps between pages are handled.
+6. **Deterministic index identity.** `index_id` is the first 16 hex chars of a
+   SHA-256 over the chunking parameters plus provider/model/dims (and
+   `hard_max_table_tokens`), so a changed config cannot silently reuse a
+   stale index.
+7. **Batched embedding.** All chunk `index_text` values go to the existing
+   `EmbeddingClient` in one call (cache-first, `task_type` supplied by the
+   provider config, not hardcoded). Vectors are re-normalised with
+   `np.maximum(norm, 1e-12)`.
+8. **Atomic publish.** Artifacts are staged in a temp sibling directory and
+   renamed into place; `vectors.npy` is written through an open file handle so
+   NumPy cannot append `.npy` to the temp name.
+
+### Verification evidence
+
+```
+$ python -m uv run ruff check src tests
+All checks passed!
+
+$ python -m uv run mypy src tests
+Success: no issues found in 37 source files
+
+$ python -m uv run pytest -q
+254 passed
+```
+
+Fully offline: chunking tests inject `OfflineTokenizer` and a fake embedder;
+the CLI tests monkeypatch both seams. No tiktoken blob download and no network.
+
+### Pending operator run (Terminal 2)
+
+Before Sprint 3B-2, build the three shared Jina indexes on the real corpus:
+
+```powershell
+python -m uv run rag-eval corpus parse && python -m uv run rag-eval corpus stats
+python -m uv run --env-file .env rag-eval index build --strategy fixed_token --max-tokens 512 --embedding-provider jina
+python -m uv run --env-file .env rag-eval index build --strategy structure_aware --embedding-provider jina
+python -m uv run --env-file .env rag-eval index build --strategy contextual_heading --embedding-provider jina
+```
+
 ## Not done (deliberately)
 
+- No retriever, reranker integration, generator, or LLM-as-judge evaluator yet.
 - No golden QA items were generated; only the schema fixture exists.
-- No chunking, vector index, retrieval metrics, or LLM-as-judge yet.
 - No `source_url` values were invented; the manual corpus is pinned by SHA-256.
 
 ## Next phase
 
-Sprint 3B should build chunking over `data/processed/docs/*.json` while
-preserving `(doc_id, page_num, start_char, end_char)` provenance, then the
-retrieval layer. Metrics must wait for the hand-written golden QA set.
+Sprint 3B-2 should add the query-side retriever over the built indexes
+(FTS5 + cosine over `vectors.npy`), still preserving `(doc_id, page_num,
+start_char, end_char)` provenance. Metrics must wait for the hand-written
+golden QA set.

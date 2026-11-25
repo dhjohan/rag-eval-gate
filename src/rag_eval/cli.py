@@ -48,6 +48,15 @@ from rag_eval.ingest.manifest import (
     sha256_file,
 )
 from rag_eval.ingest.models import CanonicalDocument
+from rag_eval.pipeline.index import (
+    DEFAULT_DOCS_DIR,
+    DEFAULT_INDEXES_DIR,
+    IndexBuildError,
+    build_index,
+    list_indexes,
+    read_manifest,
+)
+from rag_eval.pipeline.models import STRATEGY_VALUES, ChunkConfig
 from rag_eval.providers.embeddings import EmbeddingClient, EmbeddingError
 from rag_eval.providers.llm import AllProvidersFailed, LLMRouter
 from rag_eval.providers.rerank import Reranker, RerankError
@@ -79,6 +88,13 @@ dataset_app = typer.Typer(
     help="Golden QA dataset: validate citations and summarise coverage.",
 )
 app.add_typer(dataset_app, name="dataset")
+
+index_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Hybrid index: chunk the parsed corpus and build FTS5 + vector artifacts.",
+)
+app.add_typer(index_app, name="index")
 
 
 @app.command()
@@ -734,6 +750,166 @@ def dataset_stats(
             f"WARN  {len(problems)} line(s) could not be parsed (see `dataset validate`)",
             fg=typer.colors.YELLOW,
         )
+
+
+@index_app.command("build")
+def index_build(
+    strategy: str = typer.Option(
+        "structure_aware",
+        "--strategy",
+        help="Chunking strategy: fixed_token, structure_aware, or contextual_heading.",
+    ),
+    max_tokens: int | None = typer.Option(
+        None,
+        "--max-tokens",
+        help="Token window size (fixed_token defaults to 512, others to 450).",
+    ),
+    overlap_tokens: int | None = typer.Option(
+        None, "--overlap-tokens", help="Token overlap between windows (default 64)."
+    ),
+    hard_max_table_tokens: int = typer.Option(
+        900, "--hard-max-table-tokens", help="Cap before an oversized table is split."
+    ),
+    embedding_provider: str = typer.Option(
+        "jina", "--embedding-provider", help="Embedding provider from providers.yaml."
+    ),
+    config: Path | None = typer.Option(
+        None, "--config", "-c", help="Path to providers.yaml."
+    ),
+    docs_dir: Path = typer.Option(
+        DEFAULT_DOCS_DIR, "--docs-dir", help="Directory holding canonical documents."
+    ),
+    out_dir: Path = typer.Option(
+        DEFAULT_INDEXES_DIR, "--out-dir", help="Directory holding built indexes."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Rebuild even if a fresh matching index exists."
+    ),
+) -> None:
+    """Chunk the parsed corpus and build a hybrid FTS5 + vector index."""
+    if strategy not in STRATEGY_VALUES:
+        typer.secho(
+            f"FAIL  --strategy must be one of: {', '.join(STRATEGY_VALUES)}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    resolved_max = max_tokens
+    if resolved_max is None:
+        resolved_max = 512 if strategy == "fixed_token" else 450
+    resolved_overlap = overlap_tokens if overlap_tokens is not None else 64
+
+    try:
+        chunk_config = ChunkConfig.model_validate(
+            {
+                "strategy": strategy,
+                "max_tokens": resolved_max,
+                "overlap_tokens": resolved_overlap,
+                "hard_max_table_tokens": hard_max_table_tokens,
+            }
+        )
+    except ValueError as exc:
+        typer.secho(f"FAIL  invalid chunk configuration: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from None
+
+    settings = Settings()
+    providers_config_path = config if config is not None else settings.rag_eval_providers_config
+
+    try:
+        result = build_index(
+            chunk_config,
+            docs_dir=docs_dir,
+            out_dir=out_dir,
+            embedding_provider=embedding_provider,
+            providers_config_path=providers_config_path,
+            force=force,
+        )
+    except (IndexBuildError, ConfigError, EmbeddingError) as exc:
+        typer.secho(f"FAIL  {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+    manifest = result.manifest
+    typer.echo(f"index_id    {manifest.index_id}")
+    typer.echo(f"path        {result.index_dir}")
+    typer.echo(f"strategy    {manifest.chunk_config.strategy}")
+    typer.echo(
+        f"chunking    max_tokens={manifest.chunk_config.max_tokens} "
+        f"overlap={manifest.chunk_config.overlap_tokens} "
+        f"hard_max_table={manifest.chunk_config.hard_max_table_tokens}"
+    )
+    typer.echo(
+        f"embedding   {manifest.embedding_provider} / {manifest.embedding_model} "
+        f"dims={manifest.dims}"
+    )
+    typer.echo(f"chunks      {manifest.chunk_count}")
+    typer.echo(f"corpus      sha256={manifest.corpus_sha256[:16]}…")
+
+    if result.skipped:
+        typer.secho("SKIP  index is already fresh (use --force to rebuild)", fg=typer.colors.YELLOW)
+        return
+    typer.secho("OK    index built", fg=typer.colors.GREEN)
+
+
+@index_app.command("info")
+def index_info(
+    index_id: str | None = typer.Argument(
+        None, help="Specific index id; omit to list every built index."
+    ),
+    out_dir: Path = typer.Option(
+        DEFAULT_INDEXES_DIR, "--out-dir", help="Directory holding built indexes."
+    ),
+) -> None:
+    """List built indexes or show one manifest in detail."""
+    if index_id is None:
+        manifests = list_indexes(out_dir)
+        if not manifests:
+            typer.secho(f"WARN  no indexes found in {out_dir}", fg=typer.colors.YELLOW)
+            return
+        table = Table(title=f"indexes  {out_dir}", header_style="bold")
+        table.add_column("index_id", no_wrap=True)
+        table.add_column("strategy", no_wrap=True)
+        table.add_column("max_tok", justify="right", no_wrap=True)
+        table.add_column("provider", no_wrap=True)
+        table.add_column("model", overflow="fold")
+        table.add_column("dims", justify="right", no_wrap=True)
+        table.add_column("chunks", justify="right", no_wrap=True)
+        table.add_column("created_at", no_wrap=True)
+        for manifest in sorted(manifests, key=lambda item: item.index_id):
+            table.add_row(
+                manifest.index_id,
+                manifest.chunk_config.strategy,
+                str(manifest.chunk_config.max_tokens),
+                manifest.embedding_provider,
+                manifest.embedding_model,
+                str(manifest.dims),
+                str(manifest.chunk_count),
+                manifest.created_at,
+            )
+        Console().print(table)
+        return
+
+    try:
+        manifest = read_manifest(Path(out_dir) / index_id)
+    except IndexBuildError as exc:
+        typer.secho(f"FAIL  {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+    typer.echo(f"index_id    {manifest.index_id}")
+    typer.echo(f"path        {Path(out_dir) / index_id}")
+    typer.echo(f"strategy    {manifest.chunk_config.strategy}")
+    typer.echo(
+        f"chunking    max_tokens={manifest.chunk_config.max_tokens} "
+        f"overlap={manifest.chunk_config.overlap_tokens} "
+        f"hard_max_table={manifest.chunk_config.hard_max_table_tokens}"
+    )
+    typer.echo(
+        f"embedding   {manifest.embedding_provider} / {manifest.embedding_model} "
+        f"dims={manifest.dims}"
+    )
+    typer.echo(f"chunks      {manifest.chunk_count}")
+    typer.echo(f"corpus      sha256={manifest.corpus_sha256}")
+    typer.echo(f"created_at  {manifest.created_at}")
 
 
 def _print_manifest(entries: list[ManifestEntry]) -> None:
