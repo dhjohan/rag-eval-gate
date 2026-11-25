@@ -157,3 +157,23 @@ documents:
   category: fda_digital_health
   local_filename: FDA-Postmarket-Cybersecurity-Guidance.pdf
   expected_sha256: cf373dbe12c45896df215107477f9c2034c00dc0953f6b4cb76133be573cd0c1
+- doc_id: fda-applying-human-factors-and-usability-engineering
+  title: FDA Applying Human Factors and Usability Engineering
+  category: fda_digital_health
+  local_filename: FDA-Applying-Human-Factors-and-Usability-Engineering.pdf
+  expected_sha256: 9b49b108f88e04eaa63143f9ace07b0fef878e40353b198581dfb603c24e1b20
+- doc_id: fda-cade-510k-guidance
+  title: FDA CADe 510k Guidance
+  category: fda_digital_health
+  local_filename: FDA-CADe-510k-Guidance.pdf
+  expected_sha256: aad865b17e17c3c0fe6c14c255f0996ca0e1a71f50e8bbc656c236ef6c18e0c1
+- doc_id: fda-electronic-product-user-manuals-guidance
+  title: FDA Electronic Product User Manuals Guidance
+  category: fda_digital_health
+  local_filename: FDA-Electronic-Product-User-Manuals-Guidance.pdf
+  expected_sha256: 127c81c5ab2168c88e32d493de38be015a35e43ac67b85c4808110e6c0427ef8
+- doc_id: rfw-technology-in-medical-devices
+  title: RFW Technology in Medical Devices
+  category: fda_digital_health
+  local_filename: RFW-Technology-in-Medical-Devices.pdf
+  expected_sha256: 1ce44482ab855ae608af2ab3875a668af9cb7531b7b4b81a060b4f65944cba23
