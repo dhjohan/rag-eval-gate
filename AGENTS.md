@@ -42,3 +42,5 @@ Build an evals-first, CI-gated RAG system over a real messy corpus using **100% 
 - Commit on the branch, push it, and open a PR to `main`.
 - Merge only after CI is green (`ruff`, `mypy`, `pytest`, and the banned-dependency guard).
 - `main` is branch-protected: a pull request and passing status checks are required before merge.
+
+_Enable branch protection on `main` (Settings → Branches) to enforce this._
