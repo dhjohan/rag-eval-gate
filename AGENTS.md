@@ -35,3 +35,12 @@ Build an evals-first, CI-gated RAG system over a real messy corpus using **100% 
 - Lint & types: `uv run ruff check src tests`
 - Unit tests: `uv run pytest -q`
 - Check banned heavy deps: verify `uv pip list` does not include `torch` or `onnxruntime` (unless explicitly approved).
+
+## Git Workflow
+
+- Never push directly to `main`. Create `feat/<scope>` or `fix/<scope>` (docs/tooling: `chore/<scope>`).
+- Commit on the branch, push it, and open a PR to `main`.
+- Merge only after CI is green (`ruff`, `mypy`, `pytest`, and the banned-dependency guard).
+- `main` is branch-protected: a pull request and passing status checks are required before merge.
+
+_Enable branch protection on `main` (Settings → Branches) to enforce this._
