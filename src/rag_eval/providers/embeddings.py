@@ -53,6 +53,11 @@ class EmbeddingResult:
 class EmbeddingBackend(Protocol):
     """Minimal seam so tests never need the network."""
 
+    @property
+    def max_batch_size(self) -> int:
+        """Maximum number of texts per request for this backend."""
+        ...
+
     def embed(
         self,
         texts: Sequence[str],
@@ -79,6 +84,11 @@ class GoogleEmbeddingBackend:
         self.dims = dims
         self.timeout_s = timeout_s
         self._client = client
+
+    @property
+    def max_batch_size(self) -> int:
+        # Gemini embeds one text at a time to keep cache keys 1:1.
+        return 1
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -152,6 +162,12 @@ class JinaEmbeddingBackend:
         self.timeout_s = timeout_s
         self._client = client or httpx.Client(transport=transport)
         self._owns_client = client is None
+
+    @property
+    def max_batch_size(self) -> int:
+        # Jina rejects oversized input lists and large payloads; stay well below
+        # the observed 1024-item cap and typical request-size limits.
+        return 512
 
     def close(self) -> None:
         if self._owns_client:
@@ -373,26 +389,56 @@ class EmbeddingClient:
         task_type: str | None,
         cached: list[np.ndarray | None],
     ) -> None:
-        """Embed one deduplicated batch, caching each vector as it arrives."""
+        """Embed one deduplicated batch, caching each vector as it arrives.
 
-        def store(position: int, vector: Sequence[float]) -> None:
-            index = batch[position]
-            digest = hashes[index]
+        The batch is a list of indices into ``texts`` (it may be sparse when
+        only some cache entries were missing). It is split into sub-batches no
+        larger than ``backend.max_batch_size`` so providers with per-request
+        item caps (e.g. Jina) never reject the whole batch.
+        """
+
+        max_batch = backend.max_batch_size
+        if max_batch <= 0:
+            raise EmbeddingError(
+                f"backend {type(backend).__name__} has invalid max_batch_size={max_batch}"
+            )
+
+        def store(absolute_index: int, vector: Sequence[float]) -> None:
+            digest = hashes[absolute_index]
             normalised = _normalise(vector, cfg.dims)
             self._cache.put_embedding(digest, model_id, cfg.dims, normalised)
             for duplicate in indices_by_hash[digest]:
                 cached[duplicate] = normalised
 
-        fresh = backend.embed(
-            [texts[index] for index in batch],
-            task_type=task_type,
-            on_vector=store,
-        )
-        if len(fresh) != len(batch):
-            raise EmbeddingError(f"returned {len(fresh)} vectors for {len(batch)} inputs")
-        for position, vector in enumerate(fresh):
-            if cached[batch[position]] is None:
-                store(position, vector)
+        embedded = 0
+        for offset in range(0, len(batch), max_batch):
+            sub_batch = batch[offset : offset + max_batch]
+            sub_texts = [texts[index] for index in sub_batch]
+
+            def on_vector(
+                position: int, vector: Sequence[float], *, _sub=sub_batch
+            ) -> None:
+                store(_sub[position], vector)
+
+            fresh = backend.embed(
+                sub_texts,
+                task_type=task_type,
+                on_vector=on_vector,
+            )
+            if len(fresh) != len(sub_batch):
+                raise EmbeddingError(
+                    f"backend returned {len(fresh)} vectors for {len(sub_batch)} inputs"
+                )
+            for position, vector in enumerate(fresh):
+                absolute_index = sub_batch[position]
+                if cached[absolute_index] is None:
+                    store(absolute_index, vector)
+            embedded += len(fresh)
+
+        if embedded != len(batch):
+            raise EmbeddingError(
+                f"accumulated {embedded} vectors for {len(batch)} inputs"
+            )
 
 
 def _default_backend(
@@ -439,3 +485,5 @@ def _normalise(vector: Sequence[float], dims: int) -> np.ndarray:
     if norm == 0.0:
         raise EmbeddingError("embedding vector has zero norm")
     return (array / norm).astype(np.float32)
+
+

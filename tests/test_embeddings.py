@@ -8,7 +8,7 @@ import httpx
 import numpy as np
 import pytest
 
-from rag_eval.cache.sqlite_cache import SqliteCache
+from rag_eval.cache.sqlite_cache import SqliteCache, sha256_text
 from rag_eval.config import EmbeddingProviderConfig, EmbeddingsConfig
 from rag_eval.providers.embeddings import (
     AllEmbeddingProvidersFailed,
@@ -34,6 +34,10 @@ class RecordingBackend:
         self.calls: list[tuple[list[str], str | None]] = []
         self._fail = fail
         self._dims = dims
+
+    @property
+    def max_batch_size(self) -> int:
+        return 1024
 
     def embed(
         self,
@@ -368,6 +372,10 @@ class PerItemFlakyBackend:
     def __init__(self) -> None:
         self.batches: list[list[str]] = []
 
+    @property
+    def max_batch_size(self) -> int:
+        return 1024
+
     def embed(
         self,
         texts: Sequence[str],
@@ -454,6 +462,10 @@ class PermanentFailureBackend:
 
     call_count = 0
 
+    @property
+    def max_batch_size(self) -> int:
+        return 1024
+
     def embed(
         self,
         texts: Sequence[str],
@@ -518,7 +530,13 @@ def test_retryable_429_is_retried_before_failing_over(
         cache,
         api_key_resolver=lambda name: "secret",
         backend_factory=lambda name, cfg, key: type(
-            "F", (), {"embed": staticmethod(flaky_embed), "close": lambda self: None}
+            "F",
+            (),
+            {
+                "max_batch_size": property(lambda self: 1024),
+                "embed": staticmethod(flaky_embed),
+                "close": lambda self: None,
+            },
         )(),
         sleep=lambda _: None,
     )
@@ -527,3 +545,210 @@ def test_retryable_429_is_retried_before_failing_over(
 
     assert attempts == 2
     assert result.provider_used == "google"
+
+
+# -- provider batch-size limits ---------------------------------------------
+
+
+class _SplitBackend(RecordingBackend):
+    def __init__(self, max_batch: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._max_batch = max_batch
+
+    @property
+    def max_batch_size(self) -> int:
+        return self._max_batch
+
+
+def test_embed_batch_splits_by_max_batch_size(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    backend = _SplitBackend(max_batch=2)
+    client = single_client(embedding_provider(), embeddings_config, cache, backend)
+
+    result = client.embed_texts(["a", "b", "c", "d", "e"])
+
+    assert [len(call[0]) for call in backend.calls] == [2, 2, 1]
+    assert result.vectors.shape == (5, DIMS)
+
+
+def test_embed_batch_boundary_sizes(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    # Exactly one full batch, then boundary + 1, then > 2 full batches.
+    backend = _SplitBackend(max_batch=2)
+    client = single_client(embedding_provider(), embeddings_config, cache, backend)
+
+    client.embed_texts(["a", "b"])
+    assert [len(call[0]) for call in backend.calls] == [2]
+
+    backend.calls.clear()
+    client.embed_texts(["c", "d", "e"])
+    assert [len(call[0]) for call in backend.calls] == [2, 1]
+
+    backend.calls.clear()
+    client.embed_texts(["f", "g", "h", "i", "j"])
+    assert [len(call[0]) for call in backend.calls] == [2, 2, 1]
+
+
+def test_embed_batch_maps_sparse_indices_to_absolute_positions(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    provider_cfg = embedding_provider()
+    config = embeddings_config({"google": provider_cfg})
+    cfg = config.providers["google"]
+    model_id = f"{cfg.model}@{cfg.dims}:{cfg.task_type or 'default'}"
+
+    texts = ["t0", "t1", "t2", "t3", "t4"]
+    cached_vectors = {}
+    for index in (0, 2, 4):
+        vector = [0.0] * DIMS
+        vector[index] = 1.0
+        cached_vectors[index] = vector
+        cache.put_embedding(sha256_text(texts[index]), model_id, cfg.dims, vector)
+
+    class _IndexedBackend(_SplitBackend):
+        def embed(
+            self,
+            batch_texts: Sequence[str],
+            *,
+            task_type: str | None,
+            on_vector: Callable[[int, Sequence[float]], None] | None = None,
+        ) -> list[list[float]]:
+            self.calls.append((list(batch_texts), task_type))
+            vectors = []
+            for text in batch_texts:
+                index = int(text[1:])
+                vector = [0.0] * DIMS
+                vector[index] = 1.0
+                vectors.append(vector)
+            if on_vector is not None:
+                for position, vector in enumerate(vectors):
+                    on_vector(position, vector)
+            return vectors
+
+    backend = _IndexedBackend(max_batch=1)
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: backend,
+        sleep=lambda _: None,
+    )
+
+    result = client.embed_texts(texts)
+
+    # Only the two missing texts were requested, one per sub-batch.
+    assert [call[0] for call in backend.calls] == [["t1"], ["t3"]]
+    for index in range(5):
+        expected = [0.0] * DIMS
+        expected[index] = 1.0
+        np.testing.assert_allclose(result.vectors[index], expected)
+        stored = cache.get_embedding(sha256_text(texts[index]), model_id, cfg.dims)
+        assert stored is not None
+        np.testing.assert_allclose(stored, expected)
+
+
+def test_embed_batch_validates_each_sub_batch(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    class _WrongCountBackend(_SplitBackend):
+        def embed(
+            self,
+            batch_texts: Sequence[str],
+            *,
+            task_type: str | None,
+            on_vector: Callable[[int, Sequence[float]], None] | None = None,
+        ) -> list[list[float]]:
+            self.calls.append((list(batch_texts), task_type))
+            if "c" in batch_texts:
+                return []  # wrong count for this sub-batch
+            vectors = [unit_vector() for _ in batch_texts]
+            if on_vector is not None:
+                for position, vector in enumerate(vectors):
+                    on_vector(position, vector)
+            return vectors
+
+    backend = _WrongCountBackend(max_batch=2)
+    client = single_client(embedding_provider(), embeddings_config, cache, backend)
+
+    with pytest.raises(AllEmbeddingProvidersFailed, match="returned 0 vectors"):
+        client.embed_texts(["a", "b", "c"])
+
+
+def test_embed_batch_keeps_partial_progress_when_later_sub_batch_fails(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    class _FailsOnD(_SplitBackend):
+        def embed(
+            self,
+            batch_texts: Sequence[str],
+            *,
+            task_type: str | None,
+            on_vector: Callable[[int, Sequence[float]], None] | None = None,
+        ) -> list[list[float]]:
+            self.calls.append((list(batch_texts), task_type))
+            if "d" in batch_texts:
+                raise EmbeddingError("boom", retryable=False)
+            vectors = [unit_vector() for _ in batch_texts]
+            if on_vector is not None:
+                for position, vector in enumerate(vectors):
+                    on_vector(position, vector)
+            return vectors
+
+    provider_cfg = embedding_provider()
+    config = embeddings_config({"google": provider_cfg})
+    cfg = config.providers["google"]
+    model_id = f"{cfg.model}@{cfg.dims}:{cfg.task_type or 'default'}"
+    backend = _FailsOnD(max_batch=2)
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: backend,
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(AllEmbeddingProvidersFailed):
+        client.embed_texts(["a", "b", "c", "d"])
+
+    # The first sub-batch (a, b) was already paid for and must be cached.
+    assert cache.get_embedding(sha256_text("a"), model_id, cfg.dims) is not None
+    assert cache.get_embedding(sha256_text("b"), model_id, cfg.dims) is not None
+    assert cache.get_embedding(sha256_text("c"), model_id, cfg.dims) is None
+    assert cache.get_embedding(sha256_text("d"), model_id, cfg.dims) is None
+
+
+def test_backend_max_batch_sizes() -> None:
+    google = GoogleEmbeddingBackend(api_key="key", model="gemini-embedding-2", dims=DIMS)
+    jina = JinaEmbeddingBackend(
+        api_key="key", model="jina-embeddings-v5-text-nano", dims=DIMS
+    )
+
+    try:
+        assert google.max_batch_size == 1
+        assert jina.max_batch_size == 512
+    finally:
+        jina.close()
+
+
+def test_invalid_max_batch_size_is_rejected(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    backend = _SplitBackend(max_batch=0)
+    client = single_client(embedding_provider(), embeddings_config, cache, backend)
+
+    with pytest.raises(AllEmbeddingProvidersFailed, match="invalid max_batch_size"):
+        client.embed_texts(["a"])
