@@ -737,7 +737,7 @@ def test_backend_max_batch_sizes() -> None:
 
     try:
         assert google.max_batch_size == 1
-        assert jina.max_batch_size == 512
+        assert jina.max_batch_size == 64
     finally:
         jina.close()
 
@@ -752,3 +752,62 @@ def test_invalid_max_batch_size_is_rejected(
 
     with pytest.raises(AllEmbeddingProvidersFailed, match="invalid max_batch_size"):
         client.embed_texts(["a"])
+
+
+def test_retry_resends_only_the_failed_sub_batch(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    """A 429 on sub-batch #2 must retry #2 only, never re-send cached #1."""
+    sleeps: list[float] = []
+
+    class _FlakySecondBatch(_SplitBackend):
+        def __init__(self) -> None:
+            super().__init__(max_batch=2)
+            self.failed_once = False
+
+        def embed(
+            self,
+            batch_texts: Sequence[str],
+            *,
+            task_type: str | None,
+            on_vector: Callable[[int, Sequence[float]], None] | None = None,
+        ) -> list[list[float]]:
+            self.calls.append((list(batch_texts), task_type))
+            if batch_texts and batch_texts[0] == "c" and not self.failed_once:
+                self.failed_once = True
+                raise EmbeddingError("429 rate limited", retryable=True)
+            vectors = [unit_vector() for _ in batch_texts]
+            if on_vector is not None:
+                for position, vector in enumerate(vectors):
+                    on_vector(position, vector)
+            return vectors
+
+    provider_cfg = embedding_provider()
+    config = embeddings_config({"google": provider_cfg})
+    cfg = config.providers["google"]
+    model_id = f"{cfg.model}@{cfg.dims}:{cfg.task_type or 'default'}"
+    backend = _FlakySecondBatch()
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: backend,
+        sleep=sleeps.append,
+        max_retries=2,
+    )
+
+    result = client.embed_texts(["a", "b", "c", "d"])
+
+    # Request 1: [a, b]. Request 2: [c, d] (fails). Retry: [c, d] only.
+    assert [call[0] for call in backend.calls] == [
+        ["a", "b"],
+        ["c", "d"],
+        ["c", "d"],
+    ]
+    # Exactly one backoff, applied to the failed sub-batch before its retry.
+    assert len(sleeps) == 1
+    assert result.vectors.shape == (4, DIMS)
+    for text in ("a", "b", "c", "d"):
+        assert cache.get_embedding(sha256_text(text), model_id, cfg.dims) is not None

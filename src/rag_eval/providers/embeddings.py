@@ -165,9 +165,9 @@ class JinaEmbeddingBackend:
 
     @property
     def max_batch_size(self) -> int:
-        # Jina rejects oversized input lists and large payloads; stay well below
-        # the observed 1024-item cap and typical request-size limits.
-        return 512
+        # 64 chunks * ~450 tokens stays ~22k-28k tokens per request, safely
+        # under Jina Free Tier's 100k TPM and well below the 1024-item cap.
+        return 64
 
     def close(self) -> None:
         if self._owns_client:
@@ -318,6 +318,8 @@ class EmbeddingClient:
                 # transient failure does not pay for a new TLS handshake.
                 backend = self._backend_factory(name, cfg, api_key)
                 for attempt in range(self._max_retries + 1):
+                    # Recompute from the cache each attempt: vectors stored by an
+                    # earlier sub-batch are excluded, so a retry never re-sends them.
                     pending = [index for index in missing if cached[index] is None]
                     if not pending:
                         break

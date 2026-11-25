@@ -23,7 +23,7 @@ metrics, or dashboards were implemented.
 | Rerank | `src/rag_eval/providers/rerank.py` | Jina reranker client |
 | CLI | `src/rag_eval/cli.py` | `doctor`, `cache-stats` |
 | CI | `.github/workflows/ci.yml` | Offline gate + banned-dependency guard; mypy type check on push/PR |
-| Tests | `tests/` | 261 offline tests |
+| Tests | `tests/` | 262 offline tests |
 
 ## Provider catalog verification (2026-11-22)
 
@@ -454,7 +454,7 @@ integration, generator, or evaluation metrics/runners were started.
 7. **Batched embedding with provider caps.** All chunk `index_text` values go
    to the existing `EmbeddingClient` (cache-first, `task_type` supplied by the
    provider config, not hardcoded). The client splits the missing-vector batch
-   into sub-batches no larger than `backend.max_batch_size` (Jina: 512, Gemini:
+   into sub-batches no larger than `backend.max_batch_size` (Jina: 64, Gemini:
    1), so a large corpus never trips Jina's per-request item cap; partial
    progress from earlier sub-batches is cached even if a later one fails.
    Vectors are re-normalised with `np.maximum(norm, 1e-12)`.
@@ -472,7 +472,7 @@ $ python -m uv run mypy src tests
 Success: no issues found in 37 source files
 
 $ python -m uv run pytest -q
-261 passed
+262 passed
 ```
 
 Fully offline: chunking tests inject `OfflineTokenizer` and a fake embedder;
@@ -501,3 +501,4 @@ Sprint 3B-2 should add the query-side retriever over the built indexes
 (FTS5 + cosine over `vectors.npy`), still preserving `(doc_id, page_num,
 start_char, end_char)` provenance. Metrics must wait for the hand-written
 golden QA set.
+
