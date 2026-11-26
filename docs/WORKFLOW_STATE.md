@@ -52,13 +52,22 @@ prose:
 | `jina-reranker-v3` | `jina-reranker-v3.5` is current | Upgraded |
 | Cloudflare `glm-5.3-flash` / Kimi are free | Explicitly paid-only | Uses `@cf/openai/gpt-oss-120b` |
 
+Follow-up decision: the Gemini **chat** providers were later removed from
+`configs/providers.yaml` entirely. Their free-tier RPM/RPD are per-project,
+unpublished, and judged too strict for this workload, so only the Gemini
+**embedding** provider remains. The `gemini-4-*` rows above record the catalog
+check, not the current chain.
+
 ### Deliberately unverified
 
-Gemini free-tier RPM/RPD values are **not published**. The values in
-`configs/providers.yaml` (`4/20`, `4/20`, `12/500`) are marked `UNVERIFIED` in
-comments and must be confirmed at
-`https://aistudio.google.com/rate-limit?timeRange=last-28-days`.
-Gemini limits are per **project** (not per key) and reset at midnight Pacific.
+Two capabilities are marked as unproven in `configs/providers.yaml` comments and
+must be confirmed against the live services before they are trusted:
+`structured_output: json_schema` for `nvidia_super` ("UNVERIFIED against live NIM
+docs") and for `cloudflare_gpt_oss` ("schema-valid; live compliance unverified").
+
+Gemini chat quotas no longer need confirming because Gemini chat is not
+configured. The Gemini embedding provider carries no `rpm`/`rpd`/`tpm` values, so
+there is no guessed quota in the file to verify.
 
 ## Design decisions worth remembering
 
@@ -141,7 +150,7 @@ a local-first scanner that turns hand-downloaded PDFs into manifest entries.
 
 | Area | File | Notes |
 | --- | --- | --- |
-| Corpus schema | `configs/corpus.yaml` | `documents: []`, commented placeholder example, `example.invalid` URL only |
+| Corpus schema | `configs/corpus.yaml` | Started as `documents: []` with a commented placeholder; later populated (see the corpus sections below) |
 | Manifest schema + scanner | `src/rag_eval/ingest/manifest.py` | Pydantic models, YAML renderer, `scan_local_pdfs`, PDF verification |
 | Downloader | `src/rag_eval/ingest/downloader.py` | Local-first, atomic `.tmp` publish, tenacity retries, always-written manifest |
 | Package exports | `src/rag_eval/ingest/__init__.py` | Public surface only |
