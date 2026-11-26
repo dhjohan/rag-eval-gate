@@ -89,7 +89,7 @@ def _default_token_counter() -> TokenCounter:
     encoding = tiktoken.get_encoding("cl100k_base")
 
     def count(text: str) -> int:
-        return len(encoding.encode(text))
+        return len(encoding.encode_ordinary(text))
 
     return count
 

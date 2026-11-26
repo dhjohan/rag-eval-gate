@@ -307,7 +307,7 @@ class EmbeddingClient:
                     cfg.tpm, clock=self._clock, sleep=self._sleep
                 )
                 self._tpm_buckets[provider] = tpm_bucket
-            # Conservative estimate: ~3 characters per token.
+            # ~3 characters per token: safe for prose, may undercount dense tables.
             estimated = sum(max(1, len(text) // 3) for text in texts)
             tpm_bucket.acquire(float(estimated))
 

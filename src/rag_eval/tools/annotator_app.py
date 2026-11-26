@@ -378,6 +378,15 @@ def main() -> None:
             except Exception as exc:  # pydantic ValidationError
                 st.error(_format_validation_error(exc))
                 return
+            if not item.unanswerable:
+                resolved: list[CitationAnchor] = []
+                for number, anchor in enumerate(item.citations, start=1):
+                    try:
+                        resolved.append(resolve_citation(anchor, documents))
+                    except (CitationError, ValueError) as exc:
+                        st.error(f"citation {number}: {exc}")
+                        return
+                item = item.model_copy(update={"citations": resolved})
             current = _read_raw_items(dataset_path)
             replaced = False
             for index, raw in enumerate(current):

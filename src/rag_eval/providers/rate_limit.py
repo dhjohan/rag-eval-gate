@@ -29,6 +29,7 @@ class AcquireOutcome:
     allowed: bool
     reason: str | None = None
     waited_s: float = 0.0
+    window: str | None = None
 
 
 class TokenBucket:
@@ -137,20 +138,20 @@ class TokenBucketTPM:
         """Block until ``tokens`` are available; return the seconds waited."""
         if tokens <= 0:
             raise ValueError("tokens must be positive")
-        # A single request larger than the burst still goes out, but it drains
-        # the bucket; subsequent requests then pay the difference.
-        request = min(float(tokens), self.capacity)
+        # Charge the full request even when it exceeds the burst: the balance
+        # may go negative, and later requests refill that debt first. Clamping
+        # the charge to ``capacity`` let sustained oversized batches exceed TPM.
+        request = float(tokens)
         with self._lock:
             self._refill_locked()
             if self._tokens >= request:
                 self._tokens -= request
                 return 0.0
             deficit = request - self._tokens
+            # Cap one wait so a huge batch cannot stall the caller for minutes;
+            # any unpaid remainder stays on the bucket as debt.
             wait_s = min(deficit / self.rate_per_second, 62.0)
-            self._tokens = min(
-                self.capacity, self._tokens + wait_s * self.rate_per_second
-            )
-            self._tokens = max(0.0, self._tokens - request)
+            self._tokens += wait_s * self.rate_per_second - request
             self._last = max(self._clock(), self._last + wait_s)
         self._sleep(wait_s)
         return wait_s
@@ -177,11 +178,13 @@ class DailyQuota:
     def window_date(self) -> str:
         return self._now().astimezone(self.tz).date().isoformat()
 
-    def try_consume(self) -> bool:
-        return self.cache.try_consume_quota(self.provider, self.window_date(), self.rpd)
+    def try_consume(self, window: str | None = None) -> bool:
+        return self.cache.try_consume_quota(
+            self.provider, window or self.window_date(), self.rpd
+        )
 
-    def release(self) -> None:
-        self.cache.release_quota(self.provider, self.window_date())
+    def release(self, window: str | None = None) -> None:
+        self.cache.release_quota(self.provider, window or self.window_date())
 
     def used(self) -> int:
         return self.cache.get_quota_used(self.provider, self.window_date())
@@ -212,7 +215,10 @@ class ProviderLimiter:
         self.quota = DailyQuota(provider, cache, rpd=rpd, timezone=timezone, now=now)
 
     def acquire(self) -> AcquireOutcome:
-        if not self.quota.try_consume():
+        # Freeze the window now so a release after midnight refunds the day that
+        # was actually charged, not the new one.
+        window = self.quota.window_date()
+        if not self.quota.try_consume(window):
             return AcquireOutcome(allowed=False, reason="daily_quota_exhausted")
         try:
             waited = self.bucket.acquire() if self.bucket is not None else 0.0
@@ -220,13 +226,13 @@ class ProviderLimiter:
             # The quota slot was consumed but the bucket never used it (e.g.
             # interrupted during sleep); return it so the next caller isn't
             # short-changed.
-            self.quota.release()
+            self.quota.release(window)
             raise
-        return AcquireOutcome(allowed=True, waited_s=waited)
+        return AcquireOutcome(allowed=True, waited_s=waited, window=window)
 
-    def release(self) -> None:
+    def release(self, window: str | None = None) -> None:
         """Return a reservation when the request never reached the network."""
-        self.quota.release()
+        self.quota.release(window)
 
 
 def compute_backoff(

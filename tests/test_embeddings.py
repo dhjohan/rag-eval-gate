@@ -873,13 +873,13 @@ def test_tpm_pacing_large_batches_wait_proportionally(
     backend = _SplitBackend(max_batch=1024)
     client = _tpm_client(config, cache, backend, clock)
 
-    # ~9000 estimated tokens: the first fills the 7500-token burst instantly,
-    # the second must wait 7500 / 1000 = 7.5s.
+    # ~9000 estimated tokens each: the 7500-token burst covers most of the
+    # first (1.5s wait), the second is paced in full (9s). Total 10.5s.
     client.embed_texts(["x" * 27000])
-    assert clock.now == 0.0
+    assert clock.now == pytest.approx(1.5, abs=0.1)
     client.embed_texts(["y" * 27000])
 
-    assert clock.now == pytest.approx(7.5, abs=0.1)
+    assert clock.now == pytest.approx(10.5, abs=0.1)
 
 
 def test_tpm_429_uses_full_cooldown(

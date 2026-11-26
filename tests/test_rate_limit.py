@@ -11,6 +11,7 @@ from rag_eval.providers.rate_limit import (
     DailyQuota,
     ProviderLimiter,
     TokenBucket,
+    TokenBucketTPM,
     compute_backoff,
     parse_retry_after,
 )
@@ -57,6 +58,30 @@ def test_bucket_rejects_invalid_configuration() -> None:
         TokenBucket(0)
     with pytest.raises(ValueError, match="capacity"):
         TokenBucket(60, capacity=1).acquire(5)
+
+
+def test_tpm_bucket_carries_oversized_batches_as_debt() -> None:
+    clock = FakeClock()
+    bucket = TokenBucketTPM(60000, clock=clock, sleep=clock.sleep)  # burst 7500
+    # Two 9000-token batches: 7500 burst + 10500 paced at 1000/s = 10.5s.
+    assert bucket.acquire(9000) == pytest.approx(1.5)
+    assert bucket.acquire(9000) == pytest.approx(9.0)
+    assert clock.now == pytest.approx(10.5)
+
+
+def test_release_refunds_the_day_that_was_charged(cache: SqliteCache) -> None:
+    now = [datetime(2026, 11, 23, 23, 59, 59, tzinfo=UTC)]
+    limiter = ProviderLimiter(
+        "p", cache, rpd=5, now=lambda: now[0], sleep=lambda _: None
+    )
+    outcome = limiter.acquire()
+    assert cache.get_quota_used("p", "2026-11-23") == 1
+
+    now[0] = datetime(2026, 11, 24, 0, 0, 1, tzinfo=UTC)
+    limiter.release(outcome.window)
+
+    assert cache.get_quota_used("p", "2026-11-23") == 0
+    assert cache.get_quota_used("p", "2026-11-24") == 0
 
 
 def test_backoff_grows_then_caps() -> None:
