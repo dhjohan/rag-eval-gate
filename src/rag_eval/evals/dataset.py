@@ -58,6 +58,8 @@ class CitationAnchor(BaseModel):
             and self.end_char < self.start_char
         ):
             raise ValueError("end_char must be >= start_char")
+        if (self.start_char is None) != (self.end_char is None):
+            raise ValueError("start_char and end_char must be set together")
         return self
 
 

@@ -253,6 +253,13 @@ def test_whitespace_only_fields_are_rejected() -> None:
         CitationAnchor(doc_id="d", page_num=1, evidence_quote="   ")
 
 
+def test_citation_offsets_must_be_set_together() -> None:
+    with pytest.raises(ValidationError, match="set together"):
+        CitationAnchor(doc_id="d", page_num=1, evidence_quote="quote", start_char=0)
+    with pytest.raises(ValidationError, match="set together"):
+        CitationAnchor(doc_id="d", page_num=1, evidence_quote="quote", end_char=5)
+
+
 # -- loading -----------------------------------------------------------------
 
 

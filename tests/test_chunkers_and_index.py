@@ -411,6 +411,15 @@ def test_corpus_digest_tracks_text_changes() -> None:
     assert corpus_digest([first]) != corpus_digest([changed])
 
 
+def test_corpus_digest_tracks_title_and_date_changes() -> None:
+    base = _build_document(["alpha beta"])
+    retitled = _build_document(["alpha beta"], title="Other Title")
+    redated = _build_document(["alpha beta"], effective_date="2026-01-01")
+
+    assert corpus_digest([base]) != corpus_digest([retitled])
+    assert corpus_digest([base]) != corpus_digest([redated])
+
+
 # -- index build -------------------------------------------------------------
 
 

@@ -92,11 +92,17 @@ def compute_index_id(
 
 
 def corpus_digest(documents: Iterable[CanonicalDocument]) -> str:
-    """Hash the parsed corpus identity: ``(doc_id, sha256(full_text))`` pairs."""
+    """Hash the corpus identity, including metadata baked into chunk text.
+
+    ``title`` and ``effective_date`` feed the C3 contextual prefix, so they must
+    invalidate a built index just like a text change does.
+    """
     entries = sorted(
         [
             document.doc_id,
             hashlib.sha256(document.full_text.encode("utf-8")).hexdigest(),
+            document.title,
+            document.effective_date or "",
         ]
         for document in documents
     )

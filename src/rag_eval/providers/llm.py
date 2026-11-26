@@ -324,7 +324,7 @@ class LLMRouter:
             except httpx.HTTPError as exc:
                 # A transport error may mean the request never reached the
                 # provider, so give the quota slot back. A retry re-acquires.
-                limiter.release()
+                limiter.release(outcome.window)
                 if attempt < self._config.max_retries:
                     self._sleep(self._backoff(attempt))
                     continue
@@ -339,7 +339,7 @@ class LLMRouter:
                 # The provider rejected before processing, so return the slot
                 # before retrying; otherwise one throttled call would burn the
                 # daily budget once per attempt.
-                limiter.release()
+                limiter.release(outcome.window)
                 retry_after = parse_retry_after(response.headers.get("retry-after"))
                 if retry_after is not None and retry_after > self._config.backoff_cap_s:
                     # Waiting out a long provider-imposed cooldown is worse than
@@ -366,7 +366,7 @@ class LLMRouter:
 
             if status in (401, 403):
                 # Provider rejected before processing; return the quota slot.
-                limiter.release()
+                limiter.release(outcome.window)
                 failures.append(ProviderFailure(name, "auth_rejected", status))
                 return None
 
