@@ -379,14 +379,15 @@ def main() -> None:
                 st.error(_format_validation_error(exc))
                 return
             if not item.unanswerable:
-                resolved: list[CitationAnchor] = []
+                # Validate against the canonical text, but keep writing the raw
+                # anchor: `dataset validate` is the single producer of resolved
+                # JSON, so the source JSONL diff stays free of offsets.
                 for number, anchor in enumerate(item.citations, start=1):
                     try:
-                        resolved.append(resolve_citation(anchor, documents))
+                        resolve_citation(anchor, documents)
                     except (CitationError, ValueError) as exc:
                         st.error(f"citation {number}: {exc}")
                         return
-                item = item.model_copy(update={"citations": resolved})
             current = _read_raw_items(dataset_path)
             replaced = False
             for index, raw in enumerate(current):

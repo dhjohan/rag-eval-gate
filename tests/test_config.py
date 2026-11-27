@@ -80,7 +80,8 @@ def test_rerank_uses_current_model() -> None:
 def test_embedding_fallback_is_off_by_default() -> None:
     config = load_providers_config(CONFIG_PATH, env={"CLOUDFLARE_ACCOUNT_ID": "x"})
     assert config.embeddings.fallback_enabled is False
-    assert config.embeddings.ordered_providers == ["google"]
+    assert config.embeddings.ordered_providers == ["jina"]
+    assert config.embeddings.order == ["jina", "google"]
 
 
 def test_expand_env_reports_missing_variables() -> None:
