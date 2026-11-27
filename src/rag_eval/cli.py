@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import typer
 from rich.console import Console
@@ -57,6 +58,12 @@ from rag_eval.pipeline.index import (
     read_manifest,
 )
 from rag_eval.pipeline.models import STRATEGY_VALUES, ChunkConfig
+from rag_eval.pipeline.retriever import (
+    RETRIEVAL_MODES,
+    HybridRetriever,
+    RetrievalError,
+    RetrievalMode,
+)
 from rag_eval.providers.embeddings import EmbeddingClient, EmbeddingError
 from rag_eval.providers.llm import AllProvidersFailed, LLMRouter
 from rag_eval.providers.rerank import Reranker, RerankError
@@ -910,6 +917,108 @@ def index_info(
     typer.echo(f"chunks      {manifest.chunk_count}")
     typer.echo(f"corpus      sha256={manifest.corpus_sha256}")
     typer.echo(f"created_at  {manifest.created_at}")
+
+
+@app.command("query")
+def query(
+    question: str = typer.Argument(..., help="Natural-language question."),
+    mode: str = typer.Option(
+        "hybrid_rrf", "--mode", help="Retrieval mode: bm25, dense, hybrid_rrf, or rerank."
+    ),
+    top_k: int = typer.Option(5, "--top-k", min=1, max=100, help="Number of chunks to return."),
+    strategy: str = typer.Option(
+        "contextual_heading",
+        "--strategy",
+        help="Index strategy to use when --index is omitted.",
+    ),
+    index_id: str | None = typer.Option(
+        None, "--index", help="Explicit index id; overrides --strategy."
+    ),
+    out_dir: Path = typer.Option(
+        DEFAULT_INDEXES_DIR, "--out-dir", help="Directory holding built indexes."
+    ),
+    config: Path | None = typer.Option(
+        None, "--config", "-c", help="Path to providers.yaml."
+    ),
+) -> None:
+    """Retrieve the best chunks for a question from a built hybrid index."""
+    if mode not in RETRIEVAL_MODES:
+        typer.secho(
+            f"FAIL  --mode must be one of: {', '.join(RETRIEVAL_MODES)}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if strategy not in STRATEGY_VALUES:
+        typer.secho(
+            f"FAIL  --strategy must be one of: {', '.join(STRATEGY_VALUES)}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    if index_id is None:
+        matches = [
+            manifest
+            for manifest in list_indexes(out_dir)
+            if manifest.chunk_config.strategy == strategy
+        ]
+        if not matches:
+            typer.secho(
+                f"FAIL  no {strategy} index in {out_dir}; run `rag-eval index build`",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if len(matches) > 1:
+            ids = ", ".join(sorted(manifest.index_id for manifest in matches))
+            typer.secho(
+                f"FAIL  multiple {strategy} indexes ({ids}); pass --index",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        index_id = matches[0].index_id
+
+    settings = Settings()
+    config_path = config if config is not None else settings.rag_eval_providers_config
+    try:
+        with HybridRetriever(
+            Path(out_dir) / index_id,
+            mode=cast(RetrievalMode, mode),
+            top_k=top_k,
+            providers_config_path=config_path,
+            settings=settings,
+        ) as retriever:
+            results = retriever.search(question)
+            manifest = retriever.manifest
+    except (RetrievalError, EmbeddingError, RerankError, ConfigError) as exc:
+        typer.secho(f"FAIL  {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+    typer.echo(f"index   {manifest.index_id}  {manifest.chunk_config.strategy}")
+    typer.echo(f"mode    {mode}")
+    typer.echo(f"query   {question}")
+    typer.echo("")
+    if not results:
+        typer.secho("WARN  no chunks matched", fg=typer.colors.YELLOW)
+        return
+
+    for rank, chunk in enumerate(results, start=1):
+        pages = (
+            str(chunk.page_start)
+            if chunk.page_start == chunk.page_end
+            else f"{chunk.page_start}-{chunk.page_end}"
+        )
+        snippet = " ".join(chunk.raw_text.split())
+        if len(snippet) > 160:
+            snippet = snippet[:157] + "..."
+        typer.echo(f"{rank}. {chunk.doc_id} p.{pages}  score={chunk.score:.4f}")
+        if chunk.section_path:
+            typer.echo(f"   section: {chunk.section_path}")
+        typer.echo(f"   {snippet}")
+        typer.echo("")
+    typer.secho(f"OK    {len(results)} chunk(s)", fg=typer.colors.GREEN)
 
 
 def _print_manifest(entries: list[ManifestEntry]) -> None:
