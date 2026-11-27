@@ -27,7 +27,7 @@ jobs:
         run: uv run ruff check src tests
 
       - name: Type check
-        run: uv run mypy src tests
+        run: uv run mypy src tests scripts
 
       - name: Tests (fully offline, no secrets)
         run: uv run pytest -q
