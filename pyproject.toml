@@ -58,6 +58,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
 python_version = "3.11"
+# Teaches mypy the runtime-only BaseSettings kwargs such as `_env_file`.
+plugins = ["pydantic.mypy"]
 
 # Pure-CPU PDF/tokenizer libraries that do not ship type stubs.
 [[tool.mypy.overrides]]
