@@ -35,7 +35,7 @@ llm:
       rpm: 35 # published cap is 40; leave headroom for retries
       rpd: 9000 # published cap is 10,000
       rpd_timezone: UTC
-      structured_output: json_schema # UNVERIFIED against live NIM docs
+      structured_output: json_schema # live-verified 2026-11-26
       supports_reasoning: true
       max_tokens: 2048
       timeout_s: 120
@@ -61,7 +61,7 @@ llm:
       rpm: 60
       rpd: 500 # self-imposed; the real budget is 10,000 Neurons/day
       rpd_timezone: UTC
-      structured_output: json_schema # schema-valid; live compliance unverified
+      structured_output: json_schema # live-verified 2026-11-26
       supports_reasoning: true
       max_tokens: 2048
       timeout_s: 120
