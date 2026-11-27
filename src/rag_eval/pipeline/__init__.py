@@ -1,4 +1,4 @@
-"""Chunking and hybrid indexing pipeline (Sprint 3B-1)."""
+"""Chunking, hybrid indexing, and query-side retrieval (Sprint 3B)."""
 
 from __future__ import annotations
 
@@ -25,6 +25,12 @@ from rag_eval.pipeline.models import (
     ChunkConfig,
     IndexManifest,
 )
+from rag_eval.pipeline.retriever import (
+    RETRIEVAL_MODES,
+    HybridRetriever,
+    RetrievalError,
+    RetrievedChunk,
+)
 from rag_eval.pipeline.tokenizer import (
     OfflineTokenizer,
     TiktokenTokenizer,
@@ -33,13 +39,17 @@ from rag_eval.pipeline.tokenizer import (
 )
 
 __all__ = [
+    "RETRIEVAL_MODES",
     "STRATEGY_VALUES",
     "Chunk",
     "ChunkConfig",
+    "HybridRetriever",
     "IndexBuildError",
     "IndexBuildResult",
     "IndexManifest",
     "OfflineTokenizer",
+    "RetrievalError",
+    "RetrievedChunk",
     "TiktokenTokenizer",
     "Tokenizer",
     "build_index",
