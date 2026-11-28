@@ -12,6 +12,7 @@ from rag_eval.cache.sqlite_cache import SqliteCache, sha256_text
 from rag_eval.config import EmbeddingProviderConfig, EmbeddingsConfig
 from rag_eval.providers.embeddings import (
     AllEmbeddingProvidersFailed,
+    EmbeddingBackend,
     EmbeddingClient,
     EmbeddingError,
     GoogleEmbeddingBackend,
@@ -1041,3 +1042,296 @@ def test_429_honours_retry_after_header(
 
     assert attempts == 2
     assert sleeps == [5.0]
+
+
+# -- Retry-After ceiling ------------------------------------------------------
+
+
+def _jina_ok_handler(request: httpx.Request) -> httpx.Response:
+    body = json.loads(request.content)
+    return httpx.Response(
+        200,
+        json={
+            "data": [
+                {"index": index, "embedding": unit_vector()}
+                for index in range(len(body["input"]))
+            ]
+        },
+    )
+
+
+def test_retry_after_above_ceiling_fails_over_without_sleeping(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    google_backend = JinaEmbeddingBackend(
+        api_key="secret",
+        model="gemini-embedding-2",
+        dims=DIMS,
+        base_url="https://g.test/v1",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                429, headers={"retry-after": "3600"}, text="slow down"
+            )
+        ),
+    )
+    jina_backend = JinaEmbeddingBackend(
+        api_key="secret",
+        model="jina-embeddings-v5-text-nano",
+        dims=DIMS,
+        base_url="https://j.test/v1",
+        transport=httpx.MockTransport(_jina_ok_handler),
+    )
+    providers = {
+        "google": embedding_provider(base_url="https://g.test/v1"),
+        "jina": embedding_provider(
+            base_url="https://j.test/v1", model="jina-embeddings-v5-text-nano"
+        ),
+    }
+    config = embeddings_config(providers, order=["google", "jina"], fallback=True)
+    sleeps: list[float] = []
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: {
+            "google": google_backend,
+            "jina": jina_backend,
+        }[name],
+        sleep=sleeps.append,
+        max_retries=2,
+    )
+
+    result = client.embed_texts(["alpha"])
+
+    # A 3600s cooldown must not be slept through: google fails over to jina.
+    assert result.provider_used == "jina"
+    assert sleeps == []
+
+
+def test_retry_after_at_ceiling_is_still_slept(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429, headers={"retry-after": "120"}, text="slow down"
+            )
+        return httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": unit_vector()}]}
+        )
+
+    backend = JinaEmbeddingBackend(
+        api_key="secret",
+        model="jina-embeddings-v5-text-nano",
+        dims=DIMS,
+        transport=httpx.MockTransport(handler),
+    )
+    provider_cfg = embedding_provider(model="jina-embeddings-v5-text-nano")
+    config = embeddings_config({"jina": provider_cfg}, order=["jina"])
+    sleeps: list[float] = []
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=lambda name, cfg, key: backend,
+        sleep=sleeps.append,
+        max_retries=2,
+    )
+
+    result = client.embed_texts(["alpha"])
+
+    # 120s is at (not above) the ceiling, so it is honoured like the 62s TPM
+    # cooldown instead of triggering failover.
+    assert attempts == 2
+    assert sleeps == [120.0]
+    assert result.vectors.shape == (1, DIMS)
+
+
+# -- Google SDK error classification ------------------------------------------
+
+
+class _GoogleAPIError(Exception):
+    """Mimics a google-genai error carrying an HTTP status and headers."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        status_code: int | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.code = code
+        if status_code is not None:
+            self.status_code = status_code
+        if headers is not None:
+            self.headers = headers
+
+
+class _FailingModels:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    def embed_content(self, *, model: str, contents: str, config: Any) -> Any:
+        self.calls += 1
+        raise self._exc
+
+
+class _FailingClient:
+    def __init__(self, exc: Exception) -> None:
+        self.models = _FailingModels(exc)
+
+
+def _google_backend_raising(exc: Exception) -> tuple[GoogleEmbeddingBackend, _FailingClient]:
+    client = _FailingClient(exc)
+    backend = GoogleEmbeddingBackend(
+        api_key="secret", model="gemini-embedding-2", dims=DIMS, client=client
+    )
+    return backend, client
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404])
+def test_google_permanent_client_errors_are_not_retryable(code: int) -> None:
+    backend, _client = _google_backend_raising(_GoogleAPIError("bad request", code=code))
+
+    with pytest.raises(EmbeddingError, match="google embedding failed") as excinfo:
+        backend.embed(["alpha"], task_type=None)
+
+    assert excinfo.value.retryable is False
+    assert excinfo.value.retry_after is None
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+def test_google_permanent_errors_via_status_code_are_not_retryable(
+    status_code: int,
+) -> None:
+    backend, _client = _google_backend_raising(
+        _GoogleAPIError("unauthorized", status_code=status_code)
+    )
+
+    with pytest.raises(EmbeddingError) as excinfo:
+        backend.embed(["alpha"], task_type=None)
+
+    assert excinfo.value.retryable is False
+
+
+def test_google_429_is_retryable_and_parses_retry_after() -> None:
+    backend, _client = _google_backend_raising(
+        _GoogleAPIError(
+            "rate limited", code=429, headers={"Retry-After": "7"}
+        )
+    )
+
+    with pytest.raises(EmbeddingError) as excinfo:
+        backend.embed(["alpha"], task_type=None)
+
+    assert excinfo.value.retryable is True
+    assert excinfo.value.retry_after == 7.0
+
+
+@pytest.mark.parametrize("code", [500, 502, 503])
+def test_google_server_errors_are_retryable_without_retry_after(code: int) -> None:
+    backend, _client = _google_backend_raising(_GoogleAPIError("boom", code=code))
+
+    with pytest.raises(EmbeddingError) as excinfo:
+        backend.embed(["alpha"], task_type=None)
+
+    assert excinfo.value.retryable is True
+    assert excinfo.value.retry_after is None
+
+
+def test_google_transport_error_is_retryable() -> None:
+    backend, _client = _google_backend_raising(
+        httpx.ConnectError("connection reset")
+    )
+
+    with pytest.raises(EmbeddingError) as excinfo:
+        backend.embed(["alpha"], task_type=None)
+
+    assert excinfo.value.retryable is True
+    assert excinfo.value.retry_after is None
+
+
+def test_google_permanent_error_fails_over_without_retry(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    google_backend, google_client = _google_backend_raising(
+        _GoogleAPIError("forbidden", code=403)
+    )
+    providers = {
+        "google": embedding_provider(base_url="https://g.test/v1"),
+        "jina": embedding_provider(
+            base_url="https://j.test/v1", model="jina-embeddings-v5-text-nano"
+        ),
+    }
+    config = embeddings_config(providers, order=["google", "jina"], fallback=True)
+    healthy = RecordingBackend()
+    backends: dict[str, EmbeddingBackend] = {"google": google_backend, "jina": healthy}
+
+    def factory(name: str, cfg: Any, key: str) -> EmbeddingBackend:
+        return backends[name]
+
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=factory,
+        sleep=lambda _: None,
+        max_retries=2,
+    )
+
+    result = client.embed_texts(["alpha"])
+
+    assert result.provider_used == "jina"
+    # A 403 is permanent: no retries on google despite max_retries=2.
+    assert google_client.models.calls == 1
+
+
+# -- Google backend client ownership ------------------------------------------
+
+
+class _ClosableStubClient(_StubClient):
+    def __init__(self, values: list[float]) -> None:
+        super().__init__(values)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_google_backend_close_only_closes_internally_created_client() -> None:
+    # An injected client is owned by the caller and must not be closed.
+    external = _ClosableStubClient(unit_vector())
+    backend = GoogleEmbeddingBackend(
+        api_key="secret", model="gemini-embedding-2", dims=DIMS, client=external
+    )
+    backend.close()
+    assert external.closed is False
+
+    # A client the backend created itself (lazily, on first embed) is closed.
+    owned = _ClosableStubClient(unit_vector())
+    internal = GoogleEmbeddingBackend(
+        api_key="secret", model="gemini-embedding-2", dims=DIMS
+    )
+    internal._client = owned  # simulate the lazily created genai client
+    internal.close()
+    assert owned.closed is True
+
+    # Closing before any client exists is a no-op, not an error.
+    fresh = GoogleEmbeddingBackend(
+        api_key="secret", model="gemini-embedding-2", dims=DIMS
+    )
+    fresh.close()

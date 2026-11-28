@@ -52,6 +52,10 @@ class TokenBucket:
         self._clock = clock
         self._sleep = sleep
         self._last = clock()
+        # Absolute clock time at which the most recently reserved transmission
+        # slot ends. Concurrent waiters queue behind it so they never sleep
+        # the same interval and wake together.
+        self._pending_end = self._last
         self._lock = threading.Lock()
 
     @property
@@ -77,18 +81,25 @@ class TokenBucket:
             raise ValueError(f"requested {tokens} tokens but capacity is {self.capacity}")
         with self._lock:
             self._refill_locked()
+            now = self._clock()
             if self._tokens >= tokens:
                 self._tokens -= tokens
                 return 0.0
             deficit = tokens - self._tokens
             wait_s = deficit / self.rate_per_second
+            # Reserve an absolute, non-overlapping transmission slot: a waiter
+            # that arrives while another one is still sleeping queues behind
+            # that slot instead of sleeping the same interval and waking with it.
+            slot_end = max(now, self._pending_end) + wait_s
+            self._pending_end = slot_end
             # Credit the wait explicitly and advance ``_last`` so the elapsed
             # time during ``sleep`` is not double-counted on the next refill.
             self._tokens = min(self.capacity, self._tokens + wait_s * self.rate_per_second)
             self._tokens -= tokens
-            self._last = max(self._clock(), self._last + wait_s)
-        self._sleep(wait_s)
-        return wait_s
+            self._last = max(now, self._last + wait_s)
+            waited_s = slot_end - now
+        self._sleep(waited_s)
+        return waited_s
 
 
 class TokenBucketTPM:
@@ -119,6 +130,10 @@ class TokenBucketTPM:
         self._clock = clock
         self._sleep = sleep
         self._last = clock()
+        # Absolute clock time at which the most recently reserved transmission
+        # slot ends; concurrent waiters queue behind it so they never sleep
+        # the same interval and wake together.
+        self._pending_end = self._last
         self._lock = threading.Lock()
 
     @property
@@ -144,6 +159,7 @@ class TokenBucketTPM:
         request = float(tokens)
         with self._lock:
             self._refill_locked()
+            now = self._clock()
             if self._tokens >= request:
                 self._tokens -= request
                 return 0.0
@@ -151,10 +167,16 @@ class TokenBucketTPM:
             # Cap one wait so a huge batch cannot stall the caller for minutes;
             # any unpaid remainder stays on the bucket as debt.
             wait_s = min(deficit / self.rate_per_second, 62.0)
+            # Reserve an absolute, non-overlapping transmission slot: a waiter
+            # that arrives while another one is still sleeping queues behind
+            # that slot instead of sleeping the same interval and waking with it.
+            slot_end = max(now, self._pending_end) + wait_s
+            self._pending_end = slot_end
             self._tokens += wait_s * self.rate_per_second - request
-            self._last = max(self._clock(), self._last + wait_s)
-        self._sleep(wait_s)
-        return wait_s
+            self._last = max(now, self._last + wait_s)
+            waited_s = slot_end - now
+        self._sleep(waited_s)
+        return waited_s
 
 
 class DailyQuota:

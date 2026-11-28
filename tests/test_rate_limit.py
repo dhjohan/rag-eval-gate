@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 
@@ -67,6 +69,77 @@ def test_tpm_bucket_carries_oversized_batches_as_debt() -> None:
     assert bucket.acquire(9000) == pytest.approx(1.5)
     assert bucket.acquire(9000) == pytest.approx(9.0)
     assert clock.now == pytest.approx(10.5)
+
+
+def test_tpm_bucket_caps_a_single_wait_at_62_seconds() -> None:
+    clock = FakeClock()
+    bucket = TokenBucketTPM(60000, clock=clock, sleep=clock.sleep)  # burst 7500
+    # 100k tokens against a 7.5k burst at 1000/s would need 92.5s, capped at 62s.
+    assert bucket.acquire(100_000) == pytest.approx(62.0)
+    assert clock.now == pytest.approx(62.0)
+    # The unpaid remainder stays on the bucket as negative debt.
+    assert bucket.tokens < 0
+
+
+class _SlotClock:
+    """Fake clock whose ``sleep`` never advances time.
+
+    Every waiter therefore reserves its slot at ``now == 0``; the barrier
+    makes sure all waiters have reserved before any of them "wakes", so the
+    test observes the true concurrent behaviour deterministically.
+    """
+
+    def __init__(self, parties: int) -> None:
+        self.now = 0.0
+        self.barrier = threading.Barrier(parties)
+        self.durations: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.durations.append(seconds)
+        self.barrier.wait()
+
+
+def _run_concurrently(bucket_wait: Callable[[], float], parties: int = 2) -> list[float]:
+    results: list[float] = []
+
+    def waiter() -> None:
+        results.append(bucket_wait())
+
+    threads = [threading.Thread(target=waiter) for _ in range(parties)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def test_bucket_gives_concurrent_waiters_non_overlapping_slots() -> None:
+    clock = _SlotClock(parties=2)
+    bucket = TokenBucket(60, capacity=1, clock=clock, sleep=clock.sleep)
+    assert bucket.acquire() == 0.0  # drain the single token
+
+    results = _run_concurrently(bucket.acquire)
+
+    # Both waiters needed 1s of tokens, but the second one queued behind the
+    # first's absolute slot (t=1s) instead of sleeping the same 1s and waking
+    # at the same time: its slot ends at t=2s, i.e. it slept 2s from t=0.
+    assert sorted(results) == [pytest.approx(1.0), pytest.approx(2.0)]
+    assert sorted(clock.durations) == [pytest.approx(1.0), pytest.approx(2.0)]
+
+
+def test_tpm_bucket_gives_concurrent_waiters_non_overlapping_slots() -> None:
+    clock = _SlotClock(parties=2)
+    bucket = TokenBucketTPM(60000, clock=clock, sleep=clock.sleep)  # burst 7500, 1000/s
+
+    results = _run_concurrently(lambda: bucket.acquire(9000))
+
+    # First waiter: (9000 - 7500) / 1000 = 1.5s, slot ends at t=1.5s. Second
+    # waiter queues behind it: slot ends at 1.5 + 9.0 = 10.5s, slept from t=0.
+    assert sorted(results) == [pytest.approx(1.5), pytest.approx(10.5)]
+    assert sorted(clock.durations) == [pytest.approx(1.5), pytest.approx(10.5)]
 
 
 def test_release_refunds_the_day_that_was_charged(cache: SqliteCache) -> None:

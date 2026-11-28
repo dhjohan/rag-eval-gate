@@ -504,6 +504,10 @@ def _schema_instruction(response_model: type[BaseModel]) -> str:
 # Keys whose values are data (defaults, examples, enums), not subschemas.
 _SCHEMA_METADATA_KEYS = frozenset({"default", "examples", "const", "enum"})
 
+# Mappings whose *values* are always subschemas, whatever the keys are named:
+# a model field called "default" or "examples" still needs normalising.
+_SCHEMA_MAP_KEYS = frozenset({"properties", "$defs"})
+
 
 def _strict_json_schema(schema: Any) -> Any:
     """Close every object and require every property for strict schema mode.
@@ -513,18 +517,25 @@ def _strict_json_schema(schema: Any) -> Any:
     ``required``. Pydantic only emits the former for ``extra="forbid"`` models
     and leaves optional fields out of ``required``.
 
-    Values under ``default``/``examples``/``const``/``enum`` are data, not
-    schemas, so they are copied verbatim. A schema-valued
-    ``additionalProperties`` (a free-form map field) is left intact because
-    strict mode does not support it.
+    The values of ``properties`` and ``$defs`` are recursed into regardless of
+    their names, so a property named ``default``/``examples``/``const``/``enum``
+    is still normalised as a schema. Those keys only hold data when they appear
+    as schema keywords at schema level, and are then copied verbatim. A
+    schema-valued ``additionalProperties`` (a free-form map field) is left
+    intact because strict mode does not support it.
     """
     if isinstance(schema, dict):
-        normalised = {
-            key: (
-                value if key in _SCHEMA_METADATA_KEYS else _strict_json_schema(value)
-            )
-            for key, value in schema.items()
-        }
+        normalised: dict[str, Any] = {}
+        for key, value in schema.items():
+            if key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
+                normalised[key] = {
+                    name: _strict_json_schema(subschema)
+                    for name, subschema in value.items()
+                }
+            elif key in _SCHEMA_METADATA_KEYS:
+                normalised[key] = value
+            else:
+                normalised[key] = _strict_json_schema(value)
         if normalised.get("type") == "object":
             if not isinstance(normalised.get("additionalProperties"), dict):
                 normalised["additionalProperties"] = False

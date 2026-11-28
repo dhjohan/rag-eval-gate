@@ -931,3 +931,73 @@ def test_strict_schema_leaves_defaults_and_map_values_untouched() -> None:
         "type": "string"
     }
     assert normalised["additionalProperties"] is False
+
+
+def test_strict_schema_normalises_properties_named_like_metadata_keywords() -> None:
+    # A model field may be called "default"/"examples"/"const"/"enum"; inside
+    # `properties` (and `$defs`) the values are subschemas regardless of name.
+    schema = {
+        "type": "object",
+        "properties": {
+            "default": {
+                "type": "object",
+                "properties": {"inner": {"type": "string"}},
+            },
+            "examples": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"x": {"type": "integer"}},
+                },
+            },
+            "const": {"type": "string"},
+        },
+        "$defs": {
+            "enum": {"type": "object", "properties": {"y": {"type": "number"}}},
+        },
+    }
+
+    normalised = _strict_json_schema(schema)
+
+    default_field = normalised["properties"]["default"]
+    assert default_field["additionalProperties"] is False
+    assert default_field["required"] == ["inner"]
+    items = normalised["properties"]["examples"]["items"]
+    assert items["additionalProperties"] is False
+    assert items["required"] == ["x"]
+    assert normalised["properties"]["const"] == {"type": "string"}
+    enum_def = normalised["$defs"]["enum"]
+    assert enum_def["additionalProperties"] is False
+    assert enum_def["required"] == ["y"]
+    assert normalised["additionalProperties"] is False
+
+
+def test_strict_schema_keeps_metadata_keywords_as_data_at_schema_level() -> None:
+    # At schema level (not inside properties/$defs) these keys hold data, so
+    # their values must be copied verbatim, not normalised as schemas.
+    schema = {
+        "type": "object",
+        "properties": {
+            "field": {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "default": {
+                    "type": "object",
+                    "properties": {"z": {"type": "string"}},
+                },
+                "enum": [{"type": "object", "properties": {"w": {"type": "string"}}}],
+            },
+        },
+    }
+
+    normalised = _strict_json_schema(schema)
+
+    field = normalised["properties"]["field"]
+    assert field["default"] == {
+        "type": "object",
+        "properties": {"z": {"type": "string"}},
+    }
+    assert field["enum"] == [{"type": "object", "properties": {"w": {"type": "string"}}}]
+    # ...while the field's own schema was still closed.
+    assert field["additionalProperties"] is False
+    assert field["required"] == ["a"]
