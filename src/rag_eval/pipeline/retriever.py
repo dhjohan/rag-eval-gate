@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections.abc import Callable, Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
@@ -65,6 +66,7 @@ class RetrievedChunk:
     page_end: int
     section_path: str
     raw_text: str
+    index_text: str
     score: float
 
 
@@ -108,6 +110,11 @@ class HybridRetriever:
         self._reranker = reranker
         self._owns_reranker = reranker is None
         self._chunk_ids: list[str] | None = None
+        # Created lazily by _make_embedder and reused for the retriever
+        # lifetime so the embedding client's RPM/TPM token buckets persist
+        # across search() calls; closed in close().
+        self._embed_cache: SqliteCache | None = None
+        self._embed_client: EmbeddingClient | None = None
 
         for name in ("index.sqlite", "vectors.npy", "manifest.json"):
             if not (self._index_dir / name).is_file():
@@ -128,6 +135,10 @@ class HybridRetriever:
         self.close()
 
     def close(self) -> None:
+        if self._embed_cache is not None:
+            self._embed_cache.close()
+            self._embed_cache = None
+            self._embed_client = None
         if self._owns_reranker and self._reranker is not None:
             close = getattr(self._reranker, "close", None)
             if callable(close):
@@ -155,7 +166,9 @@ class HybridRetriever:
         match = _fts_query(query)
         if not match:
             return []
-        with sqlite3.connect(self._index_dir / "index.sqlite") as connection:
+        # `with sqlite3.connect(...)` only manages the transaction; wrap in
+        # contextlib.closing so the connection itself is closed, too.
+        with closing(sqlite3.connect(self._index_dir / "index.sqlite")) as connection:
             rows = connection.execute(
                 "SELECT c.chunk_id, bm25(chunks_fts) FROM chunks_fts "
                 "JOIN chunks c ON c.rowid = chunks_fts.rowid "
@@ -198,7 +211,9 @@ class HybridRetriever:
         if not candidates:
             return []
         client = self._reranker if self._reranker is not None else self._make_reranker()
-        hits = client.rerank(query, [chunk.raw_text for chunk in candidates], top_n=limit)
+        # The reranker sees index_text (contextual prefixes, repeated table
+        # headers); results still carry raw_text for citation-grade output.
+        hits = client.rerank(query, [chunk.index_text for chunk in candidates], top_n=limit)
         for hit in hits:
             if not 0 <= hit.index < len(candidates):
                 raise RetrievalError(f"reranker returned out-of-range index {hit.index}")
@@ -211,7 +226,7 @@ class HybridRetriever:
 
     def _index_chunk_ids(self) -> list[str]:
         if self._chunk_ids is None:
-            with sqlite3.connect(self._index_dir / "index.sqlite") as connection:
+            with closing(sqlite3.connect(self._index_dir / "index.sqlite")) as connection:
                 self._chunk_ids = [
                     str(row[0])
                     for row in connection.execute(
@@ -259,17 +274,26 @@ class HybridRetriever:
                 "fallback_enabled": False,
             }
         )
-        cache_path = settings.rag_eval_cache_path
+        # One cache and one client for the whole retriever lifetime: the
+        # client owns the per-provider RPM/TPM token buckets, and recreating
+        # them per search() would reset pacing on every query. The cache is
+        # closed in close().
+        cache = self._embed_cache
+        client = self._embed_client
+        if cache is None or client is None:
+            cache = SqliteCache(settings.rag_eval_cache_path)
+            client = EmbeddingClient(
+                single,
+                cache,
+                api_key_resolver=lambda env_name: resolve_api_key(
+                    env_name, settings, environ=env
+                ),
+            )
+            self._embed_cache = cache
+            self._embed_client = client
 
         def embed(texts: Sequence[str]) -> np.ndarray:
-            with SqliteCache(cache_path) as cache:
-                result = EmbeddingClient(
-                    single,
-                    cache,
-                    api_key_resolver=lambda env_name: resolve_api_key(
-                        env_name, settings, environ=env
-                    ),
-                ).embed_texts(list(texts), task_type="RETRIEVAL_QUERY")
+            result = client.embed_texts(list(texts), task_type="RETRIEVAL_QUERY")
             if (
                 result.provider_used != self._manifest.embedding_provider
                 or result.model_used != self._manifest.embedding_model
@@ -300,10 +324,10 @@ class HybridRetriever:
         if not ranked:
             return []
         placeholders = ",".join("?" for _ in ranked)
-        with sqlite3.connect(self._index_dir / "index.sqlite") as connection:
+        with closing(sqlite3.connect(self._index_dir / "index.sqlite")) as connection:
             rows = connection.execute(
                 "SELECT chunk_id, doc_id, chunk_strategy, chunk_index, start_char, end_char, "
-                "page_start, page_end, section_path, raw_text "
+                "page_start, page_end, section_path, raw_text, index_text "
                 f"FROM chunks WHERE chunk_id IN ({placeholders})",
                 [chunk_id for chunk_id, _ in ranked],
             ).fetchall()
@@ -322,6 +346,7 @@ class HybridRetriever:
                 page_end=int(row[7]),
                 section_path=str(row[8]),
                 raw_text=str(row[9]),
+                index_text=str(row[10]),
                 score=scores[chunk_id],
             )
         missing = [chunk_id for chunk_id, _ in ranked if chunk_id not in by_id]
@@ -342,13 +367,20 @@ def _with_score(chunk: RetrievedChunk, score: float) -> RetrievedChunk:
         page_end=chunk.page_end,
         section_path=chunk.section_path,
         raw_text=chunk.raw_text,
+        index_text=chunk.index_text,
         score=score,
     )
 
 
 def _fts_query(query: str) -> str:
-    """Turn free text into a safe FTS5 OR-query over alphanumeric tokens."""
-    tokens = re.findall(r"[A-Za-z0-9]+", query)
+    """Turn free text into a safe FTS5 OR-query over unicode word tokens.
+
+    ``\\w`` with ``re.UNICODE`` keeps accented Latin and CJK characters, which
+    the FTS5 ``unicode61`` tokenizer also treats as token characters, so
+    e.g. "café" or "日本語" still match. Tokens never contain a double quote,
+    so wrapping each in double quotes is always a safe phrase query.
+    """
+    tokens = re.findall(r"\w+", query, re.UNICODE)
     return " OR ".join(f'"{token}"' for token in tokens)
 
 

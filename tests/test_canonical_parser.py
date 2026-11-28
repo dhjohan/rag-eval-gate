@@ -305,6 +305,99 @@ def test_model_rejects_table_count_mismatch() -> None:
         _document(table_count=3)
 
 
+def _tiled_payload() -> dict[str, Any]:
+    """A valid two-page document: pages tile full_text with the '\n\n' join."""
+    full_text = "alpha\n\nomega"
+    pages = [
+        {
+            "page_num": 1,
+            "start_char": 0,
+            "end_char": 5,
+            "text": "alpha",
+            "table_count": 0,
+        },
+        {
+            "page_num": 2,
+            "start_char": 7,
+            "end_char": 12,
+            "text": "omega",
+            "table_count": 0,
+        },
+    ]
+    return {
+        "doc_id": "doc",
+        "title": "Doc",
+        "sha256": SHA,
+        "page_count": 2,
+        "table_count": 0,
+        "token_count": 2,
+        "full_text": full_text,
+        "pages": pages,
+    }
+
+
+def test_model_accepts_gap_free_page_tiling() -> None:
+    document = CanonicalDocument.model_validate(_tiled_payload())
+
+    assert document.page_count == 2
+    assert document.pages[0].start_char == 0
+    assert document.pages[1].start_char == document.pages[0].end_char + 2
+    assert document.pages[-1].end_char == len(document.full_text)
+
+
+def test_model_accepts_empty_full_text_with_zero_pages() -> None:
+    payload = _tiled_payload()
+    payload.update(full_text="", pages=[], page_count=0, token_count=0)
+
+    document = CanonicalDocument.model_validate(payload)
+
+    assert document.full_text == ""
+    assert document.pages == []
+
+
+def test_model_rejects_nonempty_full_text_without_pages() -> None:
+    payload = _tiled_payload()
+    payload.update(pages=[], page_count=0)
+
+    with pytest.raises(ValidationError, match="nonempty full_text"):
+        CanonicalDocument.model_validate(payload)
+
+
+def test_model_rejects_page_gap() -> None:
+    payload = _tiled_payload()
+    # Keep the slice text consistent but start one char too late.
+    payload["pages"][1].update(start_char=8, text="mega")
+
+    with pytest.raises(ValidationError, match="separator"):
+        CanonicalDocument.model_validate(payload)
+
+
+def test_model_rejects_page_overlap() -> None:
+    payload = _tiled_payload()
+    # Start one char too early: overlaps the '\n\n' separator.
+    payload["pages"][1].update(start_char=6, text="\nomega")
+
+    with pytest.raises(ValidationError, match="separator"):
+        CanonicalDocument.model_validate(payload)
+
+
+def test_model_rejects_uncovered_suffix() -> None:
+    payload = _tiled_payload()
+    # Last page stops two chars short of the end of full_text.
+    payload["pages"][1].update(end_char=10, text="ome")
+
+    with pytest.raises(ValidationError, match="cover full_text"):
+        CanonicalDocument.model_validate(payload)
+
+
+def test_model_rejects_first_page_not_at_zero() -> None:
+    payload = _tiled_payload()
+    payload["pages"][0].update(start_char=1, text="lpha")
+
+    with pytest.raises(ValidationError, match="first page must start at char 0"):
+        CanonicalDocument.model_validate(payload)
+
+
 # -- CLI --------------------------------------------------------------------
 
 

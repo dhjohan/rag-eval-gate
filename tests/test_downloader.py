@@ -469,6 +469,80 @@ def test_missing_document_without_source_url_fails_with_hint(tmp_path: Path) -> 
     assert str(raw / "local.pdf") in entry.error
 
 
+def test_local_verification_oserror_records_failure_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local PDF that exists but cannot be read (e.g. PermissionError) must
+    become a failed manifest entry without aborting later documents."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    good = make_pdf(1500)
+    (raw / "locked.pdf").write_bytes(make_pdf(1500))
+    (raw / "fda-good.pdf").write_bytes(good)
+    config = write_corpus(
+        tmp_path,
+        [
+            {"doc_id": "fda-locked", "title": "Locked", "local_filename": "locked.pdf"},
+            {
+                "doc_id": "fda-good",
+                "title": "Good",
+                "local_filename": "fda-good.pdf",
+                "expected_sha256": hashlib.sha256(good).hexdigest(),
+            },
+        ],
+    )
+
+    def fake_verify(path: Path, *, expected_sha256: str | None = None) -> tuple[str, int]:
+        if Path(path).name == "locked.pdf":
+            raise PermissionError(13, "Permission denied", str(path))
+        return verify_pdf_file(path, expected_sha256=expected_sha256)
+
+    monkeypatch.setattr("rag_eval.ingest.downloader.verify_pdf_file", fake_verify)
+
+    summary = download_corpus(config, raw)
+
+    assert [entry.status for entry in summary.entries] == ["failed", "local_verified"]
+    locked, good_entry = summary.entries
+    assert locked.error is not None
+    assert "could not be read" in locked.error
+    assert "Permission denied" in locked.error
+    assert good_entry.sha256 == hashlib.sha256(good).hexdigest()
+    assert summary.failed_count == 1
+    assert summary.ok_count == 1
+
+    manifest = read_manifest(raw)
+    assert [row["status"] for row in manifest["documents"]] == ["failed", "local_verified"]
+    assert "Permission denied" in manifest["documents"][0]["error"]
+
+
+def test_local_verification_oserror_still_writes_run_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "locked.pdf").write_bytes(make_pdf(1500))
+    config = write_corpus(
+        tmp_path,
+        [{"doc_id": "fda-locked", "title": "Locked", "local_filename": "locked.pdf"}],
+    )
+
+    def fake_verify(path: Path, *, expected_sha256: str | None = None) -> tuple[str, int]:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr("rag_eval.ingest.downloader.verify_pdf_file", fake_verify)
+
+    summary = download_corpus(config, raw)
+
+    assert summary.has_failures
+    entry = summary.entries[0]
+    assert entry.status == "failed"
+    assert entry.error is not None
+    assert "could not be read" in entry.error
+    manifest = read_manifest(raw)
+    assert manifest["documents"][0]["status"] == "failed"
+    assert "Permission denied" in manifest["documents"][0]["error"]
+
+
 # --------------------------------------------------------------------- partial failure
 
 
