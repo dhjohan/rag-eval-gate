@@ -42,20 +42,31 @@ TARGET_MAX = 120
 UNANSWERABLE_TARGET = 12
 
 
+class AnnotatorDataError(RuntimeError):
+    """Raised when the source JSONL cannot be read without losing data."""
+
+
 def _read_raw_items(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     items: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         stripped = line.strip()
         if not stripped:
             continue
         try:
             data = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            items.append(data)
+        except json.JSONDecodeError as exc:
+            raise AnnotatorDataError(
+                f"invalid JSON in {path} on line {line_number}: {exc.msg}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise AnnotatorDataError(
+                f"expected a JSON object in {path} on line {line_number}"
+            )
+        items.append(data)
     return items
 
 
@@ -145,7 +156,12 @@ def main() -> None:
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
 
-    existing = _read_raw_items(dataset_path)
+    try:
+        existing = _read_raw_items(dataset_path)
+    except AnnotatorDataError as exc:
+        st.error(str(exc))
+        st.stop()
+        return
     doc_ids = sorted(documents)
     if not doc_ids:
         st.error("No parsed documents found. Run `rag-eval corpus parse` first.")
@@ -388,7 +404,11 @@ def main() -> None:
                     except (CitationError, ValueError) as exc:
                         st.error(f"citation {number}: {exc}")
                         return
-            current = _read_raw_items(dataset_path)
+            try:
+                current = _read_raw_items(dataset_path)
+            except AnnotatorDataError as exc:
+                st.error(str(exc))
+                return
             replaced = False
             for index, raw in enumerate(current):
                 if raw.get("qa_id") == item.qa_id:

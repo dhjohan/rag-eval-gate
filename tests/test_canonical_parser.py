@@ -374,6 +374,9 @@ def test_cli_parse_writes_canonical_json(
     )
 
     out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "removed-doc.json").write_text("stale", encoding="utf-8")
+    (out_dir / "fda-test.json").write_text("stale", encoding="utf-8")
     result = CliRunner().invoke(
         app,
         [
@@ -397,6 +400,44 @@ def test_cli_parse_writes_canonical_json(
     assert data["doc_id"] == "fda-test"
     assert data["page_count"] == 1
     assert data["full_text"].strip() == "Hello corpus"
+    assert not (out_dir / "removed-doc.json").exists()
+
+
+def test_cli_parse_removes_stale_output_when_current_document_fails(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    pdf = raw / "fda-test.pdf"
+    pdf.write_bytes(b"temporary")
+    manifest = tmp_path / "manifest.json"
+    _write_manifest(manifest, pdf, "0" * 64)
+    pdf.unlink()
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stale = out_dir / "fda-test.json"
+    stale.write_text("stale", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "corpus",
+            "parse",
+            "--manifest",
+            str(manifest),
+            "--config",
+            str(tmp_path / "missing-corpus.yaml"),
+            "--raw-dir",
+            str(raw),
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "missing file" in _combined_output(result)
+    assert not stale.exists()
 
 
 def test_cli_parse_fails_without_manifest(tmp_path: Path) -> None:

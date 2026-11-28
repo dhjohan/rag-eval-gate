@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,7 @@ from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from rag_eval.cli import app
+from rag_eval.config import Settings
 from rag_eval.ingest.models import CanonicalDocument, CanonicalPage
 from rag_eval.pipeline.chunkers import (
     _context_prefix,
@@ -30,6 +32,7 @@ from rag_eval.pipeline.index import (
     build_index,
     compute_index_id,
     corpus_digest,
+    default_embedder,
 )
 from rag_eval.pipeline.models import ChunkConfig
 from rag_eval.pipeline.tokenizer import OfflineTokenizer, TiktokenTokenizer
@@ -418,6 +421,63 @@ def test_corpus_digest_tracks_title_and_date_changes() -> None:
 
     assert corpus_digest([base]) != corpus_digest([retitled])
     assert corpus_digest([base]) != corpus_digest([redated])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("page_num", 2), ("start_char", 1), ("end_char", 11)],
+)
+def test_corpus_digest_tracks_page_geometry(field: str, value: int) -> None:
+    base = _build_document(["alpha beta"])
+    changed_page = base.pages[0].model_copy(update={field: value})
+    changed = base.model_copy(update={"pages": [changed_page]})
+
+    assert changed.full_text == base.full_text
+    assert corpus_digest([base]) != corpus_digest([changed])
+
+
+def test_default_embedder_uses_settings_for_env_and_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _providers_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["embeddings"]["providers"]["jina"]["base_url"] = (
+        "https://${JINA_API_KEY}.test/v1"
+    )
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    settings = Settings(
+        jina_api_key="settings-only",
+        rag_eval_cache_path=tmp_path / "cache.sqlite",
+    )
+    monkeypatch.setattr("rag_eval.pipeline.index.Settings", lambda: settings)
+    captured: dict[str, Any] = {}
+
+    class _FakeClient:
+        def __init__(
+            self, config: Any, cache: Any, *, api_key_resolver: Any
+        ) -> None:
+            captured["config"] = config
+            captured["api_key_resolver"] = api_key_resolver
+
+        def embed_texts(
+            self, texts: list[str], *, task_type: str | None
+        ) -> SimpleNamespace:
+            captured["task_type"] = task_type
+            return SimpleNamespace(
+                vectors=np.ones((len(texts), 64), dtype=np.float32)
+            )
+
+    monkeypatch.setattr("rag_eval.pipeline.index.EmbeddingClient", _FakeClient)
+
+    vectors = default_embedder("jina", config_path, ["alpha"])
+
+    assert vectors.shape == (1, 64)
+    provider_config = captured["config"].providers["jina"]
+    assert provider_config.base_url == "https://settings-only.test/v1"
+    assert provider_config.is_configured
+    assert captured["api_key_resolver"]("JINA_API_KEY") == "settings-only"
+    assert captured["task_type"] is None
 
 
 # -- index build -------------------------------------------------------------

@@ -6,10 +6,13 @@ Every canonical document is built in memory (and, for CLI tests, written to
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
+import sys
 from collections import Counter
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -151,6 +154,14 @@ def test_whitespace_flexible_quote_uses_true_indices() -> None:
 def test_ambiguous_quote_on_same_page_is_rejected() -> None:
     document = _build_document(["The rule applies. The rule applies."])
     anchor = _anchor(1, "The rule applies.")
+
+    with pytest.raises(CitationError, match="appears 2 times"):
+        resolve_citation(anchor, {"synthetic-doc": document})
+
+
+def test_overlapping_whitespace_flexible_matches_are_ambiguous() -> None:
+    document = _build_document(["alpha  alpha  alpha"])
+    anchor = _anchor(1, "alpha alpha")
 
     with pytest.raises(CitationError, match="appears 2 times"):
         resolve_citation(anchor, {"synthetic-doc": document})
@@ -429,6 +440,34 @@ def test_validate_reports_unresolvable_citation(tmp_path: Path) -> None:
     assert result.problems[0].line_number == 1
     assert result.problems[0].qa_id == "qa_bad"
     assert result.resolved == []
+    assert result.smoke_ids == []
+
+
+def test_validate_smoke_ids_are_a_resolved_only_subset(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    _write_document(docs_dir, _build_document(["quote"]))
+    good = _item("qa_good", "single_fact")
+    bad = _item("qa_bad", "single_fact").model_copy(
+        update={"citations": [_anchor(1, "missing")]}
+    )
+    unanswerable = _item("qa_unanswerable", "unanswerable")
+    dataset = tmp_path / "golden.jsonl"
+    dataset.write_text(
+        "\n".join(
+            json.dumps(item.model_dump(mode="json"))
+            for item in (good, bad, unanswerable)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = validate_dataset(dataset, docs_dir, smoke_size=1)
+
+    resolved_ids = {item.qa_id for item in result.resolved}
+    assert resolved_ids == {"qa_good", "qa_unanswerable"}
+    assert len(result.smoke_ids) == 1
+    assert set(result.smoke_ids) <= resolved_ids
+    assert "qa_bad" not in result.smoke_ids
 
 
 # -- CLI ---------------------------------------------------------------------
@@ -473,6 +512,10 @@ def test_cli_validate_writes_resolved_and_smoke(tmp_path: Path) -> None:
 
 def test_cli_validate_strict_fails_on_small_dataset(tmp_path: Path) -> None:
     docs_dir = _write_cli_docs(tmp_path)
+    out = tmp_path / "resolved.json"
+    smoke = tmp_path / "smoke_qa_ids.json"
+    out.write_text("keep resolved", encoding="utf-8")
+    smoke.write_text("keep smoke", encoding="utf-8")
 
     result = CliRunner().invoke(
         app,
@@ -484,13 +527,45 @@ def test_cli_validate_strict_fails_on_small_dataset(tmp_path: Path) -> None:
             "--docs-dir",
             str(docs_dir),
             "--out",
-            str(tmp_path / "resolved.json"),
+            str(out),
             "--strict",
         ],
     )
 
     assert result.exit_code == 1
     assert "at least 100" in _combined(result)
+    assert out.read_text(encoding="utf-8") == "keep resolved"
+    assert smoke.read_text(encoding="utf-8") == "keep smoke"
+
+
+def test_cli_validate_invalid_only_dataset_fails_without_writing(tmp_path: Path) -> None:
+    docs_dir = _write_cli_docs(tmp_path)
+    dataset = tmp_path / "golden.jsonl"
+    invalid = _item("qa_bad", "single_fact")
+    dataset.write_text(
+        json.dumps(invalid.model_dump(mode="json")) + "\n", encoding="utf-8"
+    )
+    out = tmp_path / "resolved.json"
+    smoke = tmp_path / "smoke_qa_ids.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "dataset",
+            "validate",
+            "--input",
+            str(dataset),
+            "--docs-dir",
+            str(docs_dir),
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "no items could be resolved" in _combined(result)
+    assert not out.exists()
+    assert not smoke.exists()
 
 
 def test_cli_validate_missing_input_fails(tmp_path: Path) -> None:
@@ -522,8 +597,172 @@ def test_cli_stats_reads_jsonl_directly() -> None:
 
 
 def test_annotator_module_imports_without_streamlit() -> None:
-    import importlib
-
     module = importlib.import_module("rag_eval.tools.annotator_app")
 
     assert callable(module.main)
+
+
+@pytest.mark.parametrize(
+    ("bad_line", "message"),
+    [
+        ("{not json", "invalid JSON"),
+        ("null", "expected a JSON object"),
+        ("[]", "expected a JSON object"),
+    ],
+)
+def test_annotator_rejects_invalid_jsonl_without_changing_source(
+    tmp_path: Path, bad_line: str, message: str
+) -> None:
+    module = importlib.import_module("rag_eval.tools.annotator_app")
+    path = tmp_path / "golden.jsonl"
+    source = f'\n{{"qa_id": "kept"}}\n{bad_line}\n'
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(module.AnnotatorDataError) as caught:
+        module._read_raw_items(path)
+
+    assert message in str(caught.value)
+    assert str(path) in str(caught.value)
+    assert "line 3" in str(caught.value)
+    assert path.read_text(encoding="utf-8") == source
+
+
+class _StreamlitStop(RuntimeError):
+    pass
+
+
+class _SessionState(dict[str, Any]):
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self[name] = value
+
+
+class _Column:
+    def __init__(self, streamlit: _FakeStreamlit) -> None:
+        self.streamlit = streamlit
+
+    def __enter__(self) -> _Column:
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.streamlit, name)
+
+
+class _FakeStreamlit(ModuleType):
+    def __init__(self) -> None:
+        super().__init__("streamlit")
+        self.session_state = _SessionState()
+        self.errors: list[str] = []
+        self.callbacks: dict[str, Any] = {}
+        self.sidebar = _Column(self)
+
+    def __getattr__(self, _name: str) -> Any:
+        return self._noop
+
+    def _noop(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def cache_resource(self, **_kwargs: Any) -> Any:
+        return lambda function: function
+
+    def error(self, message: str) -> None:
+        self.errors.append(message)
+
+    def stop(self) -> None:
+        raise _StreamlitStop
+
+    def columns(self, spec: int | list[int]) -> list[_Column]:
+        count = spec if isinstance(spec, int) else len(spec)
+        return [_Column(self) for _ in range(count)]
+
+    def selectbox(
+        self, _label: str, options: Any, *, index: int = 0, **_kwargs: Any
+    ) -> Any:
+        return options[index]
+
+    def text_input(
+        self, _label: str, *, value: str = "", **_kwargs: Any
+    ) -> str:
+        return value
+
+    def text_area(
+        self, _label: str, *, value: str = "", **_kwargs: Any
+    ) -> str:
+        return value
+
+    def number_input(
+        self, _label: str, *, value: int = 1, **_kwargs: Any
+    ) -> int:
+        return value
+
+    def button(self, label: str, **kwargs: Any) -> bool:
+        callback = kwargs.get("on_click")
+        if callback is not None:
+            args = kwargs.get("args", ())
+            self.callbacks[label] = lambda: callback(*args)
+        return False
+
+
+def test_annotator_initial_load_displays_jsonl_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = importlib.import_module("rag_eval.tools.annotator_app")
+    path = tmp_path / "golden.jsonl"
+    source = '\n{"qa_id": "kept"}\nnull\n'
+    path.write_text(source, encoding="utf-8")
+    streamlit = _FakeStreamlit()
+    monkeypatch.setitem(sys.modules, "streamlit", streamlit)
+    monkeypatch.setattr(module, "DEFAULT_DATASET", path)
+    monkeypatch.setattr(module, "load_documents", lambda _path: {})
+
+    with pytest.raises(_StreamlitStop):
+        module.main()
+
+    assert len(streamlit.errors) == 1
+    assert str(path) in streamlit.errors[0]
+    assert "line 3" in streamlit.errors[0]
+    assert path.read_text(encoding="utf-8") == source
+
+
+def test_annotator_save_displays_jsonl_error_and_preserves_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = importlib.import_module("rag_eval.tools.annotator_app")
+    path = tmp_path / "golden.jsonl"
+    path.write_text('{"qa_id": "existing"}\n', encoding="utf-8")
+    document = _build_document(["quote"])
+    streamlit = _FakeStreamlit()
+    monkeypatch.setitem(sys.modules, "streamlit", streamlit)
+    monkeypatch.setattr(module, "DEFAULT_DATASET", path)
+    monkeypatch.setattr(
+        module, "load_documents", lambda _path: {"synthetic-doc": document}
+    )
+    module.main()
+    assert "Save item" in streamlit.callbacks
+
+    corrupted = '\n{"qa_id": "existing"}\n[]\n'
+    path.write_text(corrupted, encoding="utf-8")
+    streamlit.session_state.draft = {
+        "qa_id": "qa_new",
+        "question": "q",
+        "reference_answer": "a",
+        "category": "unanswerable",
+        "difficulty": "easy",
+        "notes": "",
+        "doc_id": "synthetic-doc",
+    }
+    streamlit.session_state.citations = []
+    streamlit.callbacks["Save item"]()
+
+    assert len(streamlit.errors) == 1
+    assert str(path) in streamlit.errors[0]
+    assert "line 3" in streamlit.errors[0]
+    assert path.read_text(encoding="utf-8") == corrupted

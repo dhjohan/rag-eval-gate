@@ -455,6 +455,23 @@ def corpus_parse(
     verified = [
         entry for entry in entries if entry.status in {"downloaded", "local_verified"}
     ]
+    verified_ids = {entry.doc_id for entry in verified}
+    try:
+        if out_dir.is_dir():
+            # Removed or newly unverified documents must not survive as inputs to
+            # a later index build. Current verified outputs are removed immediately
+            # before their replacement parse below.
+            for stale in out_dir.glob("*.json"):
+                if stale.stem not in verified_ids:
+                    stale.unlink()
+    except OSError as exc:
+        typer.secho(
+            f"FAIL  cannot remove stale canonical documents in {out_dir}: {exc}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+
     if not verified:
         typer.secho("WARN  no verified documents in the manifest", fg=typer.colors.YELLOW)
         return
@@ -462,6 +479,16 @@ def corpus_parse(
     rows: list[tuple[str, str, str, str, str]] = []
     failures = 0
     for entry in verified:
+        try:
+            (out_dir / f"{entry.doc_id}.json").unlink(missing_ok=True)
+        except OSError as exc:
+            typer.secho(
+                f"FAIL  cannot replace stale canonical document for {entry.doc_id}: {exc}",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
+
         pdf_path = Path(entry.local_path)
         if not pdf_path.is_file():
             fallback = raw_dir / pdf_path.name
@@ -665,9 +692,6 @@ def dataset_validate(
         typer.secho(f"FAIL  {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from None
 
-    resolved_path = write_resolved(out, result.resolved)
-    smoke_path = write_smoke(out.with_name("smoke_qa_ids.json"), result.smoke_ids)
-
     if result.problems:
         table = Table(title="dataset validate", header_style="bold")
         table.add_column("line", justify="right", no_wrap=True)
@@ -691,25 +715,31 @@ def dataset_validate(
         f"resolved {len(result.resolved)}  problems {result.error_count}"
     )
     typer.echo(f"categories  {category_summary}")
-    typer.echo(f"resolved    {resolved_path}")
-    typer.echo(f"smoke       {smoke_path}  ({len(result.smoke_ids)} items)")
 
     strict_problems = coverage_problems(result.items) if strict else []
     for message in strict_problems:
         typer.secho(f"FAIL  {message}", fg=typer.colors.RED, err=True)
 
+    # A failed gate must never replace a previously good resolved/smoke pair.
+    if strict and (result.problems or strict_problems):
+        raise typer.Exit(code=1)
+    if not result.items:
+        typer.secho("FAIL  no valid items in the dataset", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    if not result.resolved:
+        typer.secho("FAIL  no items could be resolved", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    resolved_path = write_resolved(out, result.resolved)
+    smoke_path = write_smoke(out.with_name("smoke_qa_ids.json"), result.smoke_ids)
+    typer.echo(f"resolved    {resolved_path}")
+    typer.echo(f"smoke       {smoke_path}  ({len(result.smoke_ids)} items)")
     if result.problems:
         typer.secho(
             f"WARN  {result.error_count} problem(s); resolved output contains only "
             "valid items",
             fg=typer.colors.YELLOW,
         )
-
-    if strict and (result.problems or strict_problems):
-        raise typer.Exit(code=1)
-    if not result.items:
-        typer.secho("FAIL  no valid items in the dataset", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
     typer.secho("OK    dataset validated", fg=typer.colors.GREEN)
 
 

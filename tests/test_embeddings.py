@@ -325,6 +325,83 @@ def test_jina_backend_request_shape() -> None:
     assert seen[0]["task"] == "retrieval.passage"
 
 
+def test_jina_backend_preserves_valid_reordered_responses() -> None:
+    first = unit_vector()
+    second = [0.0] * DIMS
+    second[1] = 1.0
+    backend = JinaEmbeddingBackend(
+        api_key="secret",
+        model="jina-embeddings-v5-text-nano",
+        dims=DIMS,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"index": 1, "embedding": second},
+                        {"index": 0, "embedding": first},
+                    ]
+                },
+            )
+        ),
+    )
+    observed: list[tuple[int, Sequence[float]]] = []
+
+    vectors = backend.embed(
+        ["alpha", "beta"],
+        task_type=None,
+        on_vector=lambda position, vector: observed.append((position, vector)),
+    )
+
+    assert vectors == [first, second]
+    assert observed == [(0, first), (1, second)]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        ["not-an-object", {"index": 1, "embedding": unit_vector()}],
+        [
+            {"index": False, "embedding": unit_vector()},
+            {"index": 1, "embedding": unit_vector()},
+        ],
+        [
+            {"index": "0", "embedding": unit_vector()},
+            {"index": 1, "embedding": unit_vector()},
+        ],
+        [{"embedding": unit_vector()}, {"index": 1, "embedding": unit_vector()}],
+        [
+            {"index": 0, "embedding": unit_vector()},
+            {"index": 0, "embedding": unit_vector()},
+        ],
+        [
+            {"index": 0, "embedding": unit_vector()},
+            {"index": 2, "embedding": unit_vector()},
+        ],
+    ],
+    ids=["non-object", "bool-index", "string-index", "missing-index", "duplicate", "gap"],
+)
+def test_jina_backend_rejects_bad_indices_before_callback(data: list[Any]) -> None:
+    backend = JinaEmbeddingBackend(
+        api_key="secret",
+        model="jina-embeddings-v5-text-nano",
+        dims=DIMS,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"data": data})
+        ),
+    )
+    observed: list[tuple[int, Sequence[float]]] = []
+
+    with pytest.raises(EmbeddingError, match="jina embedding"):
+        backend.embed(
+            ["alpha", "beta"],
+            task_type=None,
+            on_vector=lambda position, vector: observed.append((position, vector)),
+        )
+
+    assert observed == []
+
+
 def test_jina_backend_surfaces_http_errors() -> None:
     backend = JinaEmbeddingBackend(
         api_key="secret",
