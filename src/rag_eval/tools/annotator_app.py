@@ -161,7 +161,10 @@ def main() -> None:
         return load_documents(dir_str)
 
     try:
-        documents = _load_docs(str(docs_dir))
+        # Key the cache on the resolved absolute path: AppTest instances in
+        # one process share the global cache, and a relative key would leak
+        # documents from one test's corpus into the next.
+        documents = _load_docs(str(docs_dir.resolve()))
     except DatasetError as exc:
         st.error(str(exc))
         st.stop()
@@ -204,10 +207,35 @@ def main() -> None:
         loadable[item.qa_id] = raw
 
     def _snapshot() -> str:
+        # Include the widget values, not just the session draft: on_click
+        # callbacks run before the script body syncs widgets into `draft`,
+        # so a same-rerun edit+load would otherwise look clean.
+        token = st.session_state.get("token", 0)
+        widget_keys = [
+            f"qa_id_{token}",
+            f"question_{token}",
+            f"answer_{token}",
+            f"category_{token}",
+            f"difficulty_{token}",
+            f"notes_{token}",
+            f"selected_doc_{token}",
+            f"selected_page_{token}",
+            f"load_choice_{token}",
+        ]
+        for index, _ in enumerate(st.session_state.get("citations", [])):
+            widget_keys.extend(
+                (
+                    f"cit_doc_{token}_{index}",
+                    f"cit_page_{token}_{index}",
+                    f"cit_quote_{token}_{index}",
+                )
+            )
+        widgets = {key: st.session_state.get(key) for key in widget_keys}
         return json.dumps(
             {
                 "draft": st.session_state.get("draft"),
                 "citations": st.session_state.get("citations"),
+                "widgets": widgets,
             },
             sort_keys=True,
             default=str,

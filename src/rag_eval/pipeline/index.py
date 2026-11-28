@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -393,18 +394,25 @@ def build_index(
         )
         # Move the previous index aside instead of deleting it, then swap the
         # staged directory in. If the swap fails, restore the backup so a
-        # failed publish never destroys the last good index.
-        if final_dir.exists():
-            if backup_dir.exists():
-                shutil.rmtree(backup_dir)
-            final_dir.rename(backup_dir)
+        # failed publish never destroys the last good index. Publish-step
+        # OSErrors surface as IndexBuildError so the CLI prints a clean FAIL.
         try:
-            temp_dir.replace(final_dir)
-        except OSError:
-            if backup_dir.exists():
-                backup_dir.rename(final_dir)
-            raise
-        shutil.rmtree(backup_dir, ignore_errors=True)
+            if final_dir.exists():
+                if backup_dir.exists():
+                    shutil.rmtree(backup_dir)
+                final_dir.rename(backup_dir)
+            try:
+                temp_dir.replace(final_dir)
+            except OSError:
+                if backup_dir.exists():
+                    # Keep the original error even if the restore fails; the
+                    # backup directory still holds the last good index.
+                    with suppress(OSError):
+                        backup_dir.rename(final_dir)
+                raise
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        except OSError as exc:
+            raise IndexBuildError(f"could not publish index {index_id}: {exc}") from exc
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -434,7 +442,9 @@ def list_indexes(out_dir: str | Path = DEFAULT_INDEXES_DIR) -> list[IndexManifes
         return []
     manifests: list[IndexManifest] = []
     for child in sorted(root.iterdir()):
-        if not child.is_dir():
+        # Skip staging/backup dot-directories: a crashed publish must not
+        # surface as a phantom second index.
+        if not child.is_dir() or child.name.startswith("."):
             continue
         try:
             manifests.append(read_manifest(child))
