@@ -6,8 +6,9 @@ Artifacts for one index live in ``data/indexes/{index_id}/``:
 * ``vectors.npy`` — L2-normalized ``float32`` matrix aligned row-for-row.
 * ``manifest.json`` — :class:`IndexManifest`.
 
-The whole directory is staged in a temporary sibling and atomically renamed, so
-readers never observe a half-built index.
+The whole directory is staged in a temporary sibling and swapped in with a
+backup of the previous index, so a failed publish rolls back instead of
+destroying the last good index.
 """
 
 from __future__ import annotations
@@ -35,7 +36,12 @@ from rag_eval.config import (
 )
 from rag_eval.ingest.models import CanonicalDocument
 from rag_eval.pipeline.chunkers import chunk_documents
-from rag_eval.pipeline.models import Chunk, ChunkConfig, IndexManifest
+from rag_eval.pipeline.models import (
+    PIPELINE_VERSION,
+    Chunk,
+    ChunkConfig,
+    IndexManifest,
+)
 from rag_eval.pipeline.tokenizer import Tokenizer, default_tokenizer
 from rag_eval.providers.embeddings import EmbeddingClient
 
@@ -78,8 +84,16 @@ def compute_index_id(
     embedding_provider: str,
     embedding_model: str,
     dims: int,
+    *,
+    task_type: str = "",
+    pipeline_version: str = PIPELINE_VERSION,
 ) -> str:
-    """Deterministic 16-hex index id from the chunking + embedding identity."""
+    """Deterministic 16-hex index id from the chunking + embedding identity.
+
+    The pipeline version and the effective document-embedding task type are
+    part of the identity: a chunker change or a different vector semantics
+    must produce a different index directory, never a silent reuse.
+    """
     payload = {
         "strategy": config.strategy,
         "max_tokens": config.max_tokens,
@@ -88,6 +102,8 @@ def compute_index_id(
         "embedding_provider": embedding_provider,
         "embedding_model": embedding_model,
         "dims": dims,
+        "task_type": task_type,
+        "pipeline_version": pipeline_version,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
@@ -130,18 +146,28 @@ def load_documents(docs_dir: str | Path) -> list[CanonicalDocument]:
     if not paths:
         raise IndexBuildError(f"no canonical documents in {directory}")
     documents: list[CanonicalDocument] = []
+    seen: dict[str, str] = {}
     for path in paths:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            documents.append(CanonicalDocument.model_validate(payload))
+            document = CanonicalDocument.model_validate(payload)
         except (ValueError, TypeError) as exc:
             raise IndexBuildError(f"invalid canonical document {path.name}: {exc}") from exc
+        # Reject before chunking/embedding: duplicate IDs would produce
+        # identical chunk IDs and only fail later at SQLite insert time.
+        if document.doc_id in seen:
+            raise IndexBuildError(
+                f"duplicate canonical doc_id {document.doc_id!r} in "
+                f"{seen[document.doc_id]} and {path.name}"
+            )
+        seen[document.doc_id] = path.name
+        documents.append(document)
     return documents
 
 
 def _resolve_embedding(
     provider: str, providers_config_path: str | Path
-) -> tuple[str, int]:
+) -> tuple[str, int, str]:
     providers = load_providers_config(providers_config_path)
     config = providers.embeddings.providers.get(provider)
     if config is None:
@@ -151,7 +177,7 @@ def _resolve_embedding(
         )
     if not config.enabled:
         raise IndexBuildError(f"embedding provider '{provider}' is disabled")
-    return config.model, config.dims
+    return config.model, config.dims, config.task_type or ""
 
 
 def _derive_embeddings_config(
@@ -307,8 +333,12 @@ def build_index(
     resolved_tokenizer = tokenizer or default_tokenizer()
     documents = load_documents(docs_dir)
     corpus_sha256 = corpus_digest(documents)
-    embedding_model, dims = _resolve_embedding(embedding_provider, providers_config_path)
-    index_id = compute_index_id(config, embedding_provider, embedding_model, dims)
+    embedding_model, dims, task_type = _resolve_embedding(
+        embedding_provider, providers_config_path
+    )
+    index_id = compute_index_id(
+        config, embedding_provider, embedding_model, dims, task_type=task_type
+    )
 
     output_root = Path(out_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -347,9 +377,12 @@ def build_index(
         corpus_sha256=corpus_sha256,
         chunk_count=len(chunks),
         created_at=datetime.now(UTC).isoformat(),
+        pipeline_version=PIPELINE_VERSION,
+        embedding_task_type=task_type,
     )
 
     temp_dir = Path(tempfile.mkdtemp(dir=output_root, prefix=f".{index_id}."))
+    backup_dir = output_root / f".{index_id}.bak"
     try:
         _write_sqlite(temp_dir / "index.sqlite", chunks)
         _save_vectors(temp_dir / "vectors.npy", matrix)
@@ -358,9 +391,20 @@ def build_index(
             encoding="utf-8",
             newline="\n",
         )
+        # Move the previous index aside instead of deleting it, then swap the
+        # staged directory in. If the swap fails, restore the backup so a
+        # failed publish never destroys the last good index.
         if final_dir.exists():
-            shutil.rmtree(final_dir)
-        temp_dir.replace(final_dir)
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+            final_dir.rename(backup_dir)
+        try:
+            temp_dir.replace(final_dir)
+        except OSError:
+            if backup_dir.exists():
+                backup_dir.rename(final_dir)
+            raise
+        shutil.rmtree(backup_dir, ignore_errors=True)
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)

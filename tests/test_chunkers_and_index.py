@@ -33,8 +33,9 @@ from rag_eval.pipeline.index import (
     compute_index_id,
     corpus_digest,
     default_embedder,
+    read_manifest,
 )
-from rag_eval.pipeline.models import ChunkConfig
+from rag_eval.pipeline.models import PIPELINE_VERSION, ChunkConfig
 from rag_eval.pipeline.tokenizer import OfflineTokenizer, TiktokenTokenizer
 
 SHA = "0" * 64
@@ -523,6 +524,7 @@ def test_build_index_writes_all_artifacts(tmp_path: Path) -> None:
         "jina",
         "jina-test",
         64,
+        task_type="RETRIEVAL_DOCUMENT",
     )
     assert (result.index_dir / "index.sqlite").is_file()
     assert (result.index_dir / "vectors.npy").is_file()
@@ -542,6 +544,8 @@ def test_build_index_writes_all_artifacts(tmp_path: Path) -> None:
     assert manifest["chunk_count"] == result.chunk_count
     assert manifest["embedding_model"] == "jina-test"
     assert manifest["dims"] == 64
+    assert manifest["pipeline_version"] == PIPELINE_VERSION
+    assert manifest["embedding_task_type"] == "RETRIEVAL_DOCUMENT"
     assert manifest["chunk_config"]["strategy"] == "structure_aware"
 
 
@@ -612,6 +616,166 @@ def test_build_index_requires_documents(tmp_path: Path) -> None:
             tokenizer=OfflineTokenizer(),
             embedder=_FakeEmbedder(),
         )
+
+
+def test_load_documents_rejects_duplicate_doc_ids_before_embedder(
+    tmp_path: Path,
+) -> None:
+    docs_dir = tmp_path / "docs"
+    document = _build_document(["alpha beta"])
+    _write_document(docs_dir, document)
+    _write_document(docs_dir, document)  # same filename, then a second file:
+    other = docs_dir / "other.json"
+    other.write_text(json.dumps(document.model_dump(mode="json")), encoding="utf-8")
+
+    embedder = _FakeEmbedder()
+    with pytest.raises(IndexBuildError, match="duplicate canonical doc_id"):
+        build_index(
+            ChunkConfig(strategy="structure_aware", max_tokens=20, overlap_tokens=4),
+            docs_dir=docs_dir,
+            out_dir=tmp_path / "indexes",
+            providers_config_path=_providers_config(tmp_path),
+            tokenizer=OfflineTokenizer(),
+            embedder=embedder,
+        )
+    assert embedder.calls == []
+
+
+def test_index_id_includes_task_type_and_pipeline_version() -> None:
+    config = ChunkConfig(strategy="structure_aware", max_tokens=20, overlap_tokens=4)
+    base = compute_index_id(config, "jina", "jina-test", 64, task_type="RETRIEVAL_DOCUMENT")
+
+    assert base != compute_index_id(
+        config, "jina", "jina-test", 64, task_type="RETRIEVAL_QUERY"
+    )
+    assert base != compute_index_id(
+        config, "jina", "jina-test", 64, task_type="RETRIEVAL_DOCUMENT", pipeline_version="1"
+    )
+    assert base == compute_index_id(
+        config, "jina", "jina-test", 64, task_type="RETRIEVAL_DOCUMENT"
+    )
+
+
+def test_read_manifest_accepts_legacy_manifest_without_version_fields(
+    tmp_path: Path,
+) -> None:
+    index_dir = tmp_path / "legacy-index"
+    index_dir.mkdir()
+    legacy = {
+        "schema_version": 1,
+        "index_id": "abc123",
+        "chunk_config": {
+            "strategy": "structure_aware",
+            "max_tokens": 450,
+            "overlap_tokens": 64,
+            "hard_max_table_tokens": 900,
+        },
+        "embedding_provider": "jina",
+        "embedding_model": "jina-test",
+        "dims": 64,
+        "corpus_sha256": "0" * 64,
+        "chunk_count": 1,
+        "created_at": "2026-11-27T00:00:00+00:00",
+    }
+    (index_dir / "manifest.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    manifest = read_manifest(index_dir)
+
+    assert manifest.pipeline_version == "1"
+    assert manifest.embedding_task_type == ""
+
+
+def test_build_index_rolls_back_when_publish_swap_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    embedder = _FakeEmbedder()
+    first = _build(tmp_path, embedder=embedder)
+    original_manifest = (first.index_dir / "manifest.json").read_text(encoding="utf-8")
+
+    real_replace = Path.replace
+
+    def failing_replace(self: Path, target: Any) -> Any:
+        if self.name.startswith("."):
+            raise OSError("simulated rename failure")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+    with pytest.raises(OSError, match="simulated rename failure"):
+        _build(tmp_path, embedder=embedder, force=True)
+
+    # The previous good index survived untouched and no temp/backup litter.
+    assert (first.index_dir / "manifest.json").read_text(encoding="utf-8") == original_manifest
+    assert read_manifest(first.index_dir).index_id == first.index_id
+    leftovers = [
+        path.name
+        for path in (tmp_path / "indexes").iterdir()
+        if path.name.startswith(".")
+    ]
+    assert leftovers == []
+
+
+class _CharTokenizer:
+    """Counts characters so separator characters consume budget in tests."""
+
+    def count(self, text: str) -> int:
+        return len(text)
+
+    def token_char_spans(self, text: str) -> list[tuple[int, int]]:
+        return [(index, index + 1) for index in range(len(text))]
+
+
+def test_c2_packing_counts_exact_slice_including_separators() -> None:
+    # Two 4-char blocks sum to 8 tokens, but the packed slice is 9 chars
+    # because of the newline separator; the cap must be enforced on the slice.
+    document = _build_document(["aaaa\nbbbb"])
+    config = ChunkConfig(strategy="structure_aware", max_tokens=8, overlap_tokens=0)
+
+    chunks = chunk_structure_aware(document, config, _CharTokenizer())
+
+    assert len(chunks) == 2
+    assert all(chunk.token_count <= 8 for chunk in chunks)
+
+
+def test_c3_index_text_stays_within_budget() -> None:
+    text = (
+        "# Long Section Name Here\n"
+        "The device must include a cybersecurity plan before submission.\n"
+        "Another sentence follows here."
+    )
+    document = _build_document([text], title="My Guidance Document")
+    config = ChunkConfig(strategy="contextual_heading", max_tokens=30, overlap_tokens=4)
+
+    chunks = chunk_contextual_heading(document, config, OfflineTokenizer())
+
+    assert chunks
+    for chunk in chunks:
+        _assert_invariant(document, chunk)
+        assert OfflineTokenizer().count(chunk.index_text) <= 30
+
+
+def test_c2_single_oversized_table_row_is_split() -> None:
+    # 22 whitespace tokens by itself, over the 12-token hard cap.
+    row = "| " + " ".join(["x"] * 20) + " |"
+    text = "# Data\n| Header |\n| --- |\n" + row
+    document = _build_document([text])
+    config = ChunkConfig(
+        strategy="structure_aware",
+        max_tokens=50,
+        overlap_tokens=5,
+        hard_max_table_tokens=12,
+    )
+
+    chunks = chunk_structure_aware(document, config, OfflineTokenizer())
+
+    table_chunks = [chunk for chunk in chunks if chunk.section_path == "Data"]
+    assert len(table_chunks) >= 2
+    tokenizer = OfflineTokenizer()
+    for chunk in table_chunks:
+        _assert_invariant(document, chunk)
+        assert tokenizer.count(chunk.index_text) <= 12
+    # The row content is fully covered across the split parts.
+    joined = "".join(chunk.raw_text for chunk in chunks)
+    assert joined.count("x") == 20
 
 
 # -- CLI ---------------------------------------------------------------------

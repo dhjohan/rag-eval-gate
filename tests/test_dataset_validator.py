@@ -10,6 +10,7 @@ import importlib
 import json
 import re
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 from types import ModuleType
@@ -23,12 +24,16 @@ from rag_eval.cli import app
 from rag_eval.evals.dataset import CATEGORY_VALUES, CitationAnchor, GoldenQAItem
 from rag_eval.evals.dataset_validator import (
     CitationError,
+    DatasetError,
     build_smoke_split,
     coverage_problems,
     dataset_statistics,
+    load_documents,
     load_golden_qa,
     resolve_citation,
     validate_dataset,
+    write_resolved,
+    write_smoke,
 )
 from rag_eval.ingest.models import CanonicalDocument, CanonicalPage
 
@@ -324,6 +329,71 @@ def test_duplicate_qa_id_is_rejected(tmp_path: Path) -> None:
     assert "duplicate qa_id" in problems[0].message
 
 
+def test_load_documents_rejects_duplicate_doc_id_naming_both_files(
+    tmp_path: Path,
+) -> None:
+    docs_dir = tmp_path / "docs"
+    document = _build_document([PAGE_1])
+    _write_document(docs_dir, document)
+    duplicate = docs_dir / "zzz_duplicate.json"
+    duplicate.write_text(
+        json.dumps(document.model_dump(mode="json")), encoding="utf-8"
+    )
+
+    with pytest.raises(DatasetError, match="duplicate canonical doc_id") as caught:
+        load_documents(docs_dir)
+
+    message = str(caught.value)
+    assert "synthetic-doc.json" in message
+    assert "zzz_duplicate.json" in message
+
+
+def test_load_documents_keys_documents_by_doc_id(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    _write_document(docs_dir, _build_document([PAGE_1], doc_id="doc-a"))
+    _write_document(docs_dir, _build_document([PAGE_2], doc_id="doc-b"))
+
+    documents = load_documents(docs_dir)
+
+    assert sorted(documents) == ["doc-a", "doc-b"]
+
+
+def test_atomic_writes_use_unique_same_directory_tmp_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[Path, str]] = []
+    real_mkstemp = tempfile.mkstemp
+
+    def spy(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        fd, name = real_mkstemp(*args, **kwargs)
+        calls.append((Path(kwargs["dir"]), Path(name).name))
+        return fd, name
+
+    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    out_dir = tmp_path / "out"
+    smoke = out_dir / "smoke.json"
+    resolved = out_dir / "resolved.json"
+    write_smoke(smoke, ["qa_001"])
+    write_smoke(smoke, ["qa_001", "qa_002"])
+    write_resolved(resolved, [])
+
+    assert len(calls) == 3
+    for directory, name in calls:
+        assert directory == out_dir
+        assert name.startswith(("smoke.json.", "resolved.json."))
+        assert name.endswith(".tmp")
+    # Every temp file got a unique name instead of a fixed '<name>.tmp'.
+    assert len({name for _, name in calls}) == 3
+    assert sorted(path.name for path in out_dir.iterdir()) == [
+        "resolved.json",
+        "smoke.json",
+    ]
+    assert json.loads(smoke.read_text(encoding="utf-8"))["qa_ids"] == [
+        "qa_001",
+        "qa_002",
+    ]
+
+
 # -- smoke split -------------------------------------------------------------
 
 
@@ -508,6 +578,69 @@ def test_cli_validate_writes_resolved_and_smoke(tmp_path: Path) -> None:
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert len(payload) == 5
     assert all(entry["citations"] or entry["unanswerable"] for entry in payload)
+
+
+def test_cli_validate_smoke_out_writes_to_a_custom_path(tmp_path: Path) -> None:
+    docs_dir = _write_cli_docs(tmp_path)
+    out = tmp_path / "eval" / "golden_qa.resolved.json"
+    smoke = tmp_path / "elsewhere" / "smoke.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "dataset",
+            "validate",
+            "--input",
+            str(FIXTURE),
+            "--docs-dir",
+            str(docs_dir),
+            "--out",
+            str(out),
+            "--smoke-out",
+            str(smoke),
+        ],
+    )
+
+    assert result.exit_code == 0, _combined(result)
+    assert out.is_file()
+    assert smoke.is_file()
+    assert not (out.parent / "smoke_qa_ids.json").exists()
+    assert len(json.loads(smoke.read_text(encoding="utf-8"))["qa_ids"]) == 5
+
+
+@pytest.mark.parametrize("spelling", ["identical", "dotdot"])
+def test_cli_validate_smoke_out_equal_to_out_fails_without_writing(
+    tmp_path: Path, spelling: str
+) -> None:
+    docs_dir = _write_cli_docs(tmp_path)
+    out = tmp_path / "eval" / "golden_qa.resolved.json"
+    out.parent.mkdir(parents=True)
+    out.write_text("keep resolved", encoding="utf-8")
+    smoke_arg = (
+        str(out) if spelling == "identical" else str(out.parent / "sub" / ".." / out.name)
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "dataset",
+            "validate",
+            "--input",
+            str(FIXTURE),
+            "--docs-dir",
+            str(docs_dir),
+            "--out",
+            str(out),
+            "--smoke-out",
+            smoke_arg,
+        ],
+    )
+
+    assert result.exit_code == 2
+    combined = _combined(result)
+    assert "--smoke-out" in combined
+    assert "same file as --out" in combined
+    assert out.read_text(encoding="utf-8") == "keep resolved"
 
 
 def test_cli_validate_strict_fails_on_small_dataset(tmp_path: Path) -> None:

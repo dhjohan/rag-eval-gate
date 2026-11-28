@@ -169,6 +169,19 @@ class PdfDownloader:
                     status="failed",
                     error=f"local file failed verification: {exc}",
                 )
+            except OSError as exc:
+                # A file that exists but cannot be stat'ed/read (permissions,
+                # AV lock, dangling handle) must not abort the whole run.
+                return ManifestEntry(
+                    doc_id=doc_id,
+                    title=title,
+                    category=category,
+                    effective_date=effective_date,
+                    local_path=local_path,
+                    source_url=source_url,
+                    status="failed",
+                    error=f"local file could not be read: {exc}",
+                )
             return ManifestEntry(
                 doc_id=doc_id,
                 title=title,

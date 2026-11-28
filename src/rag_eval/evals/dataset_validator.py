@@ -23,6 +23,7 @@ import json
 import os
 import random
 import re
+import tempfile
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -134,13 +135,18 @@ def load_golden_qa(path: str | Path) -> tuple[list[LoadedItem], list[DatasetProb
 
 
 def load_documents(docs_dir: str | Path) -> dict[str, CanonicalDocument]:
-    """Load every canonical JSON in ``docs_dir`` keyed by ``doc_id``."""
+    """Load every canonical JSON in ``docs_dir`` keyed by ``doc_id``.
+
+    Two files declaring the same ``doc_id`` are ambiguous inputs, so the
+    duplicate is rejected with a :class:`DatasetError` naming both files.
+    """
     directory = Path(docs_dir)
     if not directory.is_dir():
         raise DatasetError(
             f"canonical docs directory not found: {directory}; run `rag-eval corpus parse`"
         )
     documents: dict[str, CanonicalDocument] = {}
+    sources: dict[str, str] = {}
     for path in sorted(directory.glob("*.json")):
         try:
             document = CanonicalDocument.model_validate(
@@ -148,6 +154,13 @@ def load_documents(docs_dir: str | Path) -> dict[str, CanonicalDocument]:
             )
         except (ValueError, TypeError) as exc:
             raise DatasetError(f"invalid canonical document {path.name}: {exc}") from exc
+        previous = sources.get(document.doc_id)
+        if previous is not None:
+            raise DatasetError(
+                f"duplicate canonical doc_id '{document.doc_id}' declared by both "
+                f"{previous} and {path.name} in {directory}"
+            )
+        sources[document.doc_id] = path.name
         documents[document.doc_id] = document
     return documents
 
@@ -472,10 +485,15 @@ def build_smoke_split(
 
 
 def _atomic_write_text(target: Path, text: str) -> None:
+    """Write ``text`` to ``target`` atomically via a unique same-directory temp file."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"{target.name}.tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=target.parent, prefix=f"{target.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
     try:
-        tmp.write_text(text, encoding="utf-8", newline="\n")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
         os.replace(tmp, target)
     finally:
         with suppress(OSError):

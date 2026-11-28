@@ -13,6 +13,10 @@ STRATEGY_VALUES: tuple[str, ...] = (
     "contextual_heading",
 )
 
+# Bump when chunker/tokenizer/index-writing behavior changes so a changed
+# implementation can never reuse an index built by the old one.
+PIPELINE_VERSION = "2"
+
 
 class ChunkConfig(BaseModel):
     """How a document should be split into chunks."""
@@ -74,9 +78,14 @@ class IndexManifest(BaseModel):
     corpus_sha256: str = Field(min_length=1)
     chunk_count: int = Field(ge=0)
     created_at: str = Field(min_length=1)
+    # Defaults keep pre-version manifests readable; they can never match a
+    # freshly computed index_id, so they are rebuilt rather than trusted.
+    pipeline_version: str = "1"
+    embedding_task_type: str = ""
 
 
 __all__ = [
+    "PIPELINE_VERSION",
     "STRATEGY_VALUES",
     "Chunk",
     "ChunkConfig",

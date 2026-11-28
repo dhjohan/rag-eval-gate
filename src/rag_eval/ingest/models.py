@@ -4,7 +4,8 @@ These models are the citation-invariance contract: a golden QA item points at
 ``(doc_id, page_num, evidence_quote)`` and resolves it through
 ``full_text[page.start_char:page.end_char]`` on the canonical document. The
 validator therefore refuses any document whose page slices do not reproduce the
-recorded page text exactly.
+recorded page text exactly, or whose pages do not tile ``full_text`` gap-free
+and overlap-free with the parser's ``'\n\n'`` page separator.
 """
 
 from __future__ import annotations
@@ -83,6 +84,12 @@ class CanonicalDocument(BaseModel):
                 f"table_count {self.table_count} != sum(page.table_count) {total_tables}"
             )
 
+        if self.full_text and not self.pages:
+            raise ValueError(
+                f"nonempty full_text of length {len(self.full_text)} requires at least "
+                "one page, got 0"
+            )
+
         for page in self.pages:
             if not 0 <= page.start_char <= page.end_char <= len(self.full_text):
                 raise ValueError(
@@ -93,6 +100,27 @@ class CanonicalDocument(BaseModel):
                 raise ValueError(
                     f"page {page.page_num} text does not match "
                     f"full_text[{page.start_char}:{page.end_char}]"
+                )
+
+        # Pages must tile full_text exactly as the canonical parser joins them:
+        # page texts concatenated with the '\n\n' separator reproduce full_text,
+        # so every citation slice is gap-free and overlap-free.
+        if self.pages:
+            if self.pages[0].start_char != 0:
+                raise ValueError(
+                    f"first page must start at char 0, got {self.pages[0].start_char}"
+                )
+            for previous, page in zip(self.pages, self.pages[1:], strict=False):
+                if page.start_char != previous.end_char + 2:
+                    raise ValueError(
+                        f"pages must be joined by exactly the '\\n\\n' separator: "
+                        f"page {previous.page_num} ends at char {previous.end_char} "
+                        f"but page {page.page_num} starts at char {page.start_char}"
+                    )
+            if self.pages[-1].end_char != len(self.full_text):
+                raise ValueError(
+                    f"pages must cover full_text to its end: last page ends at char "
+                    f"{self.pages[-1].end_char} but full_text has length {len(self.full_text)}"
                 )
         return self
 

@@ -201,60 +201,86 @@ def _table_parts(
     header_text = document.full_text[
         block.start + header_lines[0][0] : block.start + header_lines[-1][1]
     ]
-
-    parts: list[list[str]] = []
-    current: list[str] = []
-    for _, _, row_text in data_lines:
-        trial = [*current, row_text]
-        trial_text = header_text + "\n" + "\n".join(trial)
-        if current and tokenizer.count(trial_text) > config.hard_max_table_tokens:
-            parts.append(current)
-            current = [row_text]
-        else:
-            current = trial
-    if current:
-        parts.append(current)
+    header_tokens = tokenizer.count(header_text)
 
     spans: list[tuple[int, int, str]] = []
-    cursor = 0
-    for part_index, rows in enumerate(parts):
-        first_line = data_lines[cursor]
-        last_line = data_lines[cursor + len(rows) - 1]
-        cursor += len(rows)
-        if part_index == 0:
-            start = block.start + header_lines[0][0]
-            end = block.start + last_line[1]
-            header = ""
+    header_covered = False
+    current: list[tuple[int, int, str]] = []  # (relative start, relative end, row)
+
+    def flush() -> None:
+        nonlocal current, header_covered
+        if not current:
+            return
+        end = block.start + current[-1][1]
+        if header_covered:
+            spans.append((block.start + current[0][0], end, header_text))
         else:
-            start = block.start + first_line[0]
-            end = block.start + last_line[1]
-            header = header_text
-        spans.append((start, end, header))
+            # Part 0 keeps the header in ``raw_text``.
+            spans.append((block.start + header_lines[0][0], end, ""))
+            header_covered = True
+        current = []
+
+    for rel_start, rel_end, row_text in data_lines:
+        if current:
+            trial_text = header_text + "\n" + "\n".join(
+                [row[2] for row in current] + [row_text]
+            )
+            if tokenizer.count(trial_text) > config.hard_max_table_tokens:
+                flush()
+        if not current and tokenizer.count(row_text) > config.hard_max_table_tokens:
+            # A single row that is oversized even on its own: split it at
+            # token boundaries as a last resort. The first piece also
+            # carries the header lines in ``raw_text`` when possible.
+            budget = max(1, config.hard_max_table_tokens - header_tokens - 1)
+            windows = list(
+                _token_windows(tokenizer.token_char_spans(row_text), budget, 0)
+            )
+            for window_index, (win_start, win_end) in enumerate(windows):
+                start = block.start + rel_start + win_start
+                end = block.start + rel_start + win_end
+                if window_index == 0 and not header_covered:
+                    spans.append((block.start + header_lines[0][0], end, ""))
+                    header_covered = True
+                else:
+                    spans.append((start, end, header_text))
+            continue
+        current.append((rel_start, rel_end, row_text))
+    flush()
+    spans.sort(key=lambda span: span[0])
     return spans
 
 
 def _structure_spans(
-    document: CanonicalDocument, config: ChunkConfig, tokenizer: Tokenizer
+    document: CanonicalDocument,
+    config: ChunkConfig,
+    tokenizer: Tokenizer,
+    *,
+    token_budget: int | None = None,
+    blocks: list[_Block] | None = None,
 ) -> list[_Span]:
+    """Pack structural blocks into spans of at most ``token_budget`` tokens.
+
+    Token counts are always taken from the exact candidate slice of
+    ``full_text`` so intervening newlines are budgeted too; summing per-block
+    counts let packed chunks exceed the cap by the separator characters.
+    """
+    budget = token_budget if token_budget is not None else config.max_tokens
     spans: list[_Span] = []
     accumulator: list[_Block] = []
-    accumulator_tokens = 0
 
     def flush() -> None:
-        nonlocal accumulator, accumulator_tokens
+        nonlocal accumulator
         if not accumulator:
             return
         spans.append(
             _Span(accumulator[0].start, accumulator[-1].end, accumulator[0].section_path)
         )
         accumulator = []
-        accumulator_tokens = 0
 
-    for block in _structure_blocks(document):
+    for block in blocks if blocks is not None else _structure_blocks(document):
         if block.kind == "heading":
             flush()
             accumulator = [block]
-            accumulator_tokens = tokenizer.count(block.text)
         elif block.kind == "table":
             flush()
             if tokenizer.count(block.text) <= config.hard_max_table_tokens:
@@ -264,20 +290,21 @@ def _structure_spans(
                     spans.append(_Span(start, end, block.section_path, header))
         else:
             paragraph_tokens = tokenizer.count(block.text)
-            if paragraph_tokens > config.max_tokens:
+            if paragraph_tokens > budget:
                 flush()
                 relative = tokenizer.token_char_spans(block.text)
-                for start, end in _token_windows(
-                    relative, config.max_tokens, config.overlap_tokens
-                ):
+                for start, end in _token_windows(relative, budget, config.overlap_tokens):
                     spans.append(
                         _Span(block.start + start, block.start + end, block.section_path)
                     )
             else:
-                if accumulator and accumulator_tokens + paragraph_tokens > config.max_tokens:
-                    flush()
+                if accumulator:
+                    trial = tokenizer.count(
+                        document.full_text[accumulator[0].start : block.end]
+                    )
+                    if trial > budget:
+                        flush()
                 accumulator.append(block)
-                accumulator_tokens += paragraph_tokens
     flush()
     return spans
 
@@ -359,13 +386,23 @@ def chunk_structure_aware(
 def chunk_contextual_heading(
     document: CanonicalDocument, config: ChunkConfig, tokenizer: Tokenizer
 ) -> list[Chunk]:
-    """C3: C2 spans plus a ``[Document | Section]`` context prefix."""
+    """C3: C2 spans plus a ``[Document | Section]`` context prefix.
+
+    The prefix is part of ``index_text``, so its tokens are subtracted from
+    the packing budget: the indexed text stays within ``max_tokens``.
+    """
+    blocks = _structure_blocks(document)
+    prefix_tokens = max(
+        (tokenizer.count(_context_prefix(document, block.section_path)) for block in blocks),
+        default=0,
+    )
+    budget = max(1, config.max_tokens - prefix_tokens - 1)
     return _emit(
         document,
         config,
         tokenizer,
         "contextual_heading",
-        _structure_spans(document, config, tokenizer),
+        _structure_spans(document, config, tokenizer, token_budget=budget, blocks=blocks),
         contextual=True,
     )
 

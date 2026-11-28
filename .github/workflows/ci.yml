@@ -38,3 +38,20 @@ jobs:
             echo "::error::Banned heavy dependency detected"
             exit 1
           fi
+
+  ui:
+    name: annotator app tests (ui extra)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install dependencies with the ui extra
+        run: uv sync --frozen --extra ui
+
+      - name: Annotator app tests (streamlit AppTest)
+        run: uv run pytest -q tests/test_annotator_app.py

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import random
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -24,6 +24,11 @@ from rag_eval.providers.rate_limit import (
     compute_backoff,
     parse_retry_after,
 )
+
+# A provider-imposed cooldown longer than this is not worth sleeping through:
+# the client fails that provider over to the next one instead of blocking for
+# e.g. an hour. The intentional 62s Jina TPM cooldown stays well under it.
+_MAX_RETRY_AFTER_S = 120.0
 
 _JINA_TASKS = {
     "RETRIEVAL_DOCUMENT": "retrieval.passage",
@@ -80,6 +85,56 @@ class EmbeddingBackend(Protocol):
     ) -> list[list[float]]: ...
 
 
+# HTTP statuses the Gemini SDK can raise that will never succeed on retry
+# (bad request, auth/permission problems, unknown resource).
+_GOOGLE_PERMANENT_CODES = frozenset({400, 401, 403, 404})
+
+
+def _google_error_code(exc: BaseException) -> int | None:
+    """Extract an HTTP status code from an SDK exception, if it carries one."""
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        return value
+    return None
+
+
+def _google_retry_after(exc: BaseException) -> float | None:
+    """Parse a ``Retry-After`` hint exposed by the SDK exception, if any."""
+    raw = getattr(exc, "retry_after", None)
+    if raw is None:
+        headers = getattr(exc, "headers", None)
+        if headers is None:
+            response = getattr(exc, "response", None)
+            headers = getattr(response, "headers", None) if response is not None else None
+        if isinstance(headers, Mapping):
+            for key, value in headers.items():
+                if str(key).lower() == "retry-after":
+                    raw = value
+                    break
+    if raw is None:
+        return None
+    return parse_retry_after(str(raw))
+
+
+def _classify_google_error(exc: BaseException) -> tuple[bool, float | None]:
+    """Map a ``google-genai`` SDK exception to ``(retryable, retry_after)``.
+
+    Permanent client errors (400/401/403/404) are not retryable; 429 and 5xx
+    are transient and carry a ``Retry-After`` hint when the SDK exposes one.
+    Anything without an HTTP status is treated as a transport error and retried.
+    """
+    code = _google_error_code(exc)
+    if code is None:
+        return True, None
+    if code in _GOOGLE_PERMANENT_CODES:
+        return False, None
+    if code == 429 or code >= 500:
+        return True, _google_retry_after(exc)
+    return True, None
+
+
 class GoogleEmbeddingBackend:
     """Gemini embeddings through the official ``google-genai`` SDK."""
 
@@ -97,11 +152,19 @@ class GoogleEmbeddingBackend:
         self.dims = dims
         self.timeout_s = timeout_s
         self._client = client
+        self._owns_client = client is None
 
     @property
     def max_batch_size(self) -> int:
         # Gemini embeds one text at a time to keep cache keys 1:1.
         return 1
+
+    def close(self) -> None:
+        """Close the genai client, but only when this backend created it."""
+        if self._owns_client and self._client is not None:
+            closer = getattr(self._client, "close", None)
+            if callable(closer):
+                closer()
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -138,7 +201,12 @@ class GoogleEmbeddingBackend:
                     model=self.model, contents=text, config=config
                 )
             except Exception as exc:  # SDK raises provider-specific errors
-                raise EmbeddingError(f"google embedding failed: {exc}") from exc
+                retryable, retry_after = _classify_google_error(exc)
+                raise EmbeddingError(
+                    f"google embedding failed: {exc}",
+                    retryable=retryable,
+                    retry_after=retry_after,
+                ) from exc
             embeddings = getattr(response, "embeddings", None)
             if not embeddings:
                 raise EmbeddingError("google embedding returned no vectors")
@@ -413,7 +481,18 @@ class EmbeddingClient:
                             cached,
                         )
                     except EmbeddingError as exc:
-                        if exc.retryable and attempt < self._max_retries:
+                        # An explicit provider cooldown beyond the ceiling (e.g.
+                        # Retry-After: 3600) is not slept through: fail this
+                        # provider now so the next one is tried immediately.
+                        cooldown_too_long = (
+                            exc.retry_after is not None
+                            and exc.retry_after > _MAX_RETRY_AFTER_S
+                        )
+                        if (
+                            exc.retryable
+                            and not cooldown_too_long
+                            and attempt < self._max_retries
+                        ):
                             # Honour a provider cooldown (e.g. a TPM 429) instead
                             # of the short exponential backoff, which would burn
                             # every retry inside the still-blocked window.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -670,7 +671,14 @@ def dataset_validate(
         Path("data/eval/golden_qa.resolved.json"),
         "--out",
         "-o",
-        help="Resolved dataset output path (smoke split is written beside it).",
+        help="Resolved dataset output path (smoke split is written beside it "
+        "unless --smoke-out is given).",
+    ),
+    smoke_out: Path | None = typer.Option(
+        None,
+        "--smoke-out",
+        help="Smoke split output path (default: smoke_qa_ids.json beside --out). "
+        "Must not resolve to the same file as --out.",
     ),
     smoke_size: int = typer.Option(
         DEFAULT_SMOKE_SIZE, "--smoke-size", help="Number of stratified smoke items."
@@ -685,6 +693,19 @@ def dataset_validate(
     if not input_path.is_file():
         typer.secho(f"FAIL  dataset not found: {input_path}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
+
+    smoke_path = (
+        smoke_out if smoke_out is not None else out.with_name("smoke_qa_ids.json")
+    )
+    # The smoke split must never clobber the resolved output (or vice versa).
+    if os.path.normcase(str(smoke_path.resolve())) == os.path.normcase(str(out.resolve())):
+        typer.secho(
+            f"FAIL  --smoke-out ({smoke_path}) resolves to the same file as --out "
+            f"({out}); the smoke split would overwrite the resolved dataset",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
     try:
         result = validate_dataset(input_path, docs_dir, smoke_size=smoke_size)
@@ -731,9 +752,9 @@ def dataset_validate(
         raise typer.Exit(code=1)
 
     resolved_path = write_resolved(out, result.resolved)
-    smoke_path = write_smoke(out.with_name("smoke_qa_ids.json"), result.smoke_ids)
+    written_smoke_path = write_smoke(smoke_path, result.smoke_ids)
     typer.echo(f"resolved    {resolved_path}")
-    typer.echo(f"smoke       {smoke_path}  ({len(result.smoke_ids)} items)")
+    typer.echo(f"smoke       {written_smoke_path}  ({len(result.smoke_ids)} items)")
     if result.problems:
         typer.secho(
             f"WARN  {result.error_count} problem(s); resolved output contains only "
@@ -956,13 +977,17 @@ def query(
         "hybrid_rrf", "--mode", help="Retrieval mode: bm25, dense, hybrid_rrf, or rerank."
     ),
     top_k: int = typer.Option(5, "--top-k", min=1, max=100, help="Number of chunks to return."),
-    strategy: str = typer.Option(
-        "contextual_heading",
+    strategy: str | None = typer.Option(
+        None,
         "--strategy",
-        help="Index strategy to use when --index is omitted.",
+        help="Index strategy to select when --index is omitted. Default: use the "
+        "only index in --out-dir, or fail asking for --strategy/--index when "
+        "several exist.",
     ),
     index_id: str | None = typer.Option(
-        None, "--index", help="Explicit index id; overrides --strategy."
+        None,
+        "--index",
+        help="Explicit index id; overrides --strategy and auto-detection.",
     ),
     out_dir: Path = typer.Option(
         DEFAULT_INDEXES_DIR, "--out-dir", help="Directory holding built indexes."
@@ -979,7 +1004,7 @@ def query(
             err=True,
         )
         raise typer.Exit(code=2)
-    if strategy not in STRATEGY_VALUES:
+    if strategy is not None and strategy not in STRATEGY_VALUES:
         typer.secho(
             f"FAIL  --strategy must be one of: {', '.join(STRATEGY_VALUES)}",
             fg=typer.colors.RED,
@@ -988,27 +1013,48 @@ def query(
         raise typer.Exit(code=2)
 
     if index_id is None:
-        matches = [
-            manifest
-            for manifest in list_indexes(out_dir)
-            if manifest.chunk_config.strategy == strategy
-        ]
-        if not matches:
-            typer.secho(
-                f"FAIL  no {strategy} index in {out_dir}; run `rag-eval index build`",
-                fg=typer.colors.RED,
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        if len(matches) > 1:
-            ids = ", ".join(sorted(manifest.index_id for manifest in matches))
-            typer.secho(
-                f"FAIL  multiple {strategy} indexes ({ids}); pass --index",
-                fg=typer.colors.RED,
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        index_id = matches[0].index_id
+        manifests = list_indexes(out_dir)
+        if strategy is not None:
+            matches = [
+                manifest
+                for manifest in manifests
+                if manifest.chunk_config.strategy == strategy
+            ]
+            if not matches:
+                typer.secho(
+                    f"FAIL  no {strategy} index in {out_dir}; run `rag-eval index build`",
+                    fg=typer.colors.RED,
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            if len(matches) > 1:
+                ids = ", ".join(sorted(manifest.index_id for manifest in matches))
+                typer.secho(
+                    f"FAIL  multiple {strategy} indexes ({ids}); pass --index",
+                    fg=typer.colors.RED,
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            index_id = matches[0].index_id
+        else:
+            if not manifests:
+                typer.secho(
+                    f"FAIL  no indexes found in {out_dir}; run `rag-eval index build` "
+                    "or pass --index",
+                    fg=typer.colors.RED,
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            if len(manifests) > 1:
+                ids = ", ".join(sorted(manifest.index_id for manifest in manifests))
+                typer.secho(
+                    f"FAIL  multiple indexes in {out_dir} ({ids}); "
+                    "pass --strategy or --index to choose one",
+                    fg=typer.colors.RED,
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            index_id = manifests[0].index_id
 
     settings = Settings()
     config_path = config if config is not None else settings.rag_eval_providers_config
