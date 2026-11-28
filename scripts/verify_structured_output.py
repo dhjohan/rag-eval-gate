@@ -51,6 +51,7 @@ PROMPT = (
 def _single_provider_config(base: LLMConfig, provider: str, mode: str) -> LLMConfig:
     data = base.providers[provider].model_dump()
     data["structured_output"] = mode
+    data["enabled"] = True
     return LLMConfig.model_validate(
         {
             "order": [provider],
@@ -87,7 +88,7 @@ def main() -> int:
         return 2
 
     for mode in [m.strip() for m in args.modes.split(",") if m.strip()]:
-        config = _single_provider_config(base, args.provider, mode)
+        config = _single_provider_config(base.llm, args.provider, mode)
         try:
             with SqliteCache(":memory:") as cache, LLMRouter.from_settings(
                 config, cache, settings
