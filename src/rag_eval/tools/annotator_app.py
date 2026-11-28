@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from collections import Counter
 from collections.abc import Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+
+from pydantic import ValidationError
 
 from rag_eval.evals.dataset import (
     CATEGORY_VALUES,
@@ -46,10 +49,11 @@ class AnnotatorDataError(RuntimeError):
     """Raised when the source JSONL cannot be read without losing data."""
 
 
-def _read_raw_items(path: Path) -> list[dict[str, Any]]:
+def _read_raw_entries(path: Path) -> list[tuple[int, dict[str, Any]]]:
+    """Read the JSONL source as ``(1-based line number, raw dict)`` pairs."""
     if not path.is_file():
         return []
-    items: list[dict[str, Any]] = []
+    entries: list[tuple[int, dict[str, Any]]] = []
     for line_number, line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), start=1
     ):
@@ -66,15 +70,21 @@ def _read_raw_items(path: Path) -> list[dict[str, Any]]:
             raise AnnotatorDataError(
                 f"expected a JSON object in {path} on line {line_number}"
             )
-        items.append(data)
-    return items
+        entries.append((line_number, data))
+    return entries
+
+
+def _read_raw_items(path: Path) -> list[dict[str, Any]]:
+    return [item for _, item in _read_raw_entries(path)]
 
 
 def _atomic_write_jsonl(path: Path, items: Sequence[dict[str, Any]]) -> None:
+    """Write JSONL atomically via a unique same-directory temp file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
-        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             for item in items:
                 handle.write(json.dumps(item, ensure_ascii=False) + "\n")
         os.replace(tmp, path)
@@ -84,7 +94,12 @@ def _atomic_write_jsonl(path: Path, items: Sequence[dict[str, Any]]) -> None:
 
 
 def _next_qa_id(items: Sequence[dict[str, Any]]) -> str:
-    used = {item.get("qa_id") for item in items}
+    """First free ``qa_NNN`` id; non-string/unhashable ``qa_id`` values are ignored."""
+    used: set[str] = set()
+    for item in items:
+        qa_id = item.get("qa_id")
+        if isinstance(qa_id, str):
+            used.add(qa_id)
     index = 1
     while f"qa_{index:03d}" in used:
         index += 1
@@ -155,27 +170,60 @@ def main() -> None:
     st.title("Golden QA Annotation Workbench")
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
+    if st.session_state.get("pending_load_warning"):
+        st.warning(st.session_state.pop("pending_load_warning"))
 
     try:
-        existing = _read_raw_items(dataset_path)
+        entries = _read_raw_entries(dataset_path)
     except AnnotatorDataError as exc:
         st.error(str(exc))
         st.stop()
         return
+    existing = [item for _, item in entries]
     doc_ids = sorted(documents)
     if not doc_ids:
         st.error("No parsed documents found. Run `rag-eval corpus parse` first.")
         st.stop()
         return
 
+    # Schema-invalid lines stay in the file untouched, but they cannot be
+    # edited here: they are excluded from the load dropdown and reported once.
+    loadable: dict[str, dict[str, Any]] = {}
+    for line_number, raw in entries:
+        try:
+            item = GoldenQAItem.model_validate(raw)
+        except ValidationError as exc:
+            qa_id = raw.get("qa_id")
+            label = qa_id if isinstance(qa_id, str) else repr(qa_id)
+            st.warning(
+                f"line {line_number} (qa_id={label!r}) is not a valid golden QA item: "
+                f"{_format_validation_error(exc)}; kept as-is but excluded from the "
+                "load list"
+            )
+            continue
+        loadable[item.qa_id] = raw
+
+    def _snapshot() -> str:
+        return json.dumps(
+            {
+                "draft": st.session_state.get("draft"),
+                "citations": st.session_state.get("citations"),
+            },
+            sort_keys=True,
+            default=str,
+        )
+
     if "token" not in st.session_state:
         st.session_state.token = 0
     if "draft" not in st.session_state:
         st.session_state.draft = _blank_draft(_next_qa_id(existing), doc_ids[0])
+        st.session_state.draft_source = "<new>"
     if "citations" not in st.session_state:
         st.session_state.citations = [
             {"doc_id": doc_ids[0], "page_num": 1, "evidence_quote": ""}
         ]
+    if "draft_baseline" not in st.session_state:
+        st.session_state.draft_baseline = _snapshot()
     token = st.session_state.token
     draft: dict[str, Any] = st.session_state.draft
 
@@ -247,11 +295,7 @@ def main() -> None:
     with right:
         st.subheader("Golden QA item")
 
-        existing_ids: list[str] = sorted(
-            str(item["qa_id"])
-            for item in existing
-            if isinstance(item.get("qa_id"), str)
-        )
+        existing_ids: list[str] = sorted(loadable)
         load_choice = st.selectbox(
             "Load existing item",
             ["<new>", *existing_ids],
@@ -261,6 +305,11 @@ def main() -> None:
         def _apply_load(item: dict[str, Any] | None) -> None:
             if item is None:
                 return
+            if _snapshot() != st.session_state.get("draft_baseline"):
+                st.session_state.pending_load_warning = (
+                    "Discarded unsaved changes in the current draft while loading "
+                    f"{item.get('qa_id')!r}."
+                )
             st.session_state.draft = {
                 "qa_id": item.get("qa_id", ""),
                 "question": item.get("question", ""),
@@ -274,17 +323,16 @@ def main() -> None:
             st.session_state.citations = loaded_citations or [
                 {"doc_id": doc_ids[0], "page_num": 1, "evidence_quote": ""}
             ]
+            st.session_state.draft_source = str(item.get("qa_id", ""))
+            st.session_state.draft_baseline = _snapshot()
             st.session_state.token += 1
 
         if load_choice != "<new>":
-            load_item = next(
-                (item for item in existing if item.get("qa_id") == load_choice), None
-            )
             st.button(
                 "Load selected item",
                 key=f"load_btn_{token}",
                 on_click=_apply_load,
-                args=(load_item,),
+                args=(loadable.get(load_choice),),
             )
 
         draft["qa_id"] = st.text_input(
@@ -356,7 +404,11 @@ def main() -> None:
 
             if st.button("Add citation", key=f"cit_add_{token}"):
                 st.session_state.citations.append(
-                    {"doc_id": selected_doc, "page_num": 1, "evidence_quote": ""}
+                    {
+                        "doc_id": selected_doc,
+                        "page_num": selected_page,
+                        "evidence_quote": "",
+                    }
                 )
                 st.session_state.token += 1
                 st.rerun()
@@ -409,6 +461,19 @@ def main() -> None:
             except AnnotatorDataError as exc:
                 st.error(str(exc))
                 return
+            # A draft that started as "<new>" must never silently replace an
+            # existing item: the user has to load that item first.
+            origin = st.session_state.get("draft_source", "<new>")
+            allow_replace = origin != "<new>" and item.qa_id == origin
+            if not allow_replace and any(
+                raw.get("qa_id") == item.qa_id for raw in current
+            ):
+                st.error(
+                    f"qa_id '{item.qa_id}' already exists in {dataset_path}; load the "
+                    "existing item from the dropdown instead of saving a new draft "
+                    "over it"
+                )
+                return
             replaced = False
             for index, raw in enumerate(current):
                 if raw.get("qa_id") == item.qa_id:
@@ -427,6 +492,8 @@ def main() -> None:
             st.session_state.citations = [
                 {"doc_id": doc_ids[0], "page_num": 1, "evidence_quote": ""}
             ]
+            st.session_state.draft_source = "<new>"
+            st.session_state.draft_baseline = _snapshot()
             st.session_state.token += 1
             st.rerun()
 
