@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Sequence
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -1261,6 +1262,80 @@ def test_google_transport_error_is_retryable() -> None:
 
     assert excinfo.value.retryable is True
     assert excinfo.value.retry_after is None
+
+
+def test_google_bool_code_is_ignored_and_treated_as_transport() -> None:
+    # bool is an int subclass; a True code must not be read as HTTP 1.
+    backend, _client = _google_backend_raising(_GoogleAPIError("weird", code=True))  # type: ignore[arg-type]
+
+    with pytest.raises(EmbeddingError) as excinfo:
+        backend.embed(["alpha"], task_type=None)
+
+    assert excinfo.value.retryable is True
+    assert excinfo.value.retry_after is None
+
+
+def test_google_retry_after_attribute_is_honoured() -> None:
+    exc = _GoogleAPIError("rate limited", code=429)
+    exc.retry_after = 9.5  # type: ignore[attr-defined]
+    backend, _client = _google_backend_raising(exc)
+
+    with pytest.raises(EmbeddingError) as excinfo:
+        backend.embed(["alpha"], task_type=None)
+
+    assert excinfo.value.retryable is True
+    assert excinfo.value.retry_after == 9.5
+
+
+def test_google_retry_after_via_response_headers_is_honoured() -> None:
+    response = SimpleNamespace(headers={"retry-after": "11"})
+    exc = _GoogleAPIError("rate limited", code=429)
+    exc.response = response  # type: ignore[attr-defined]
+    backend, _client = _google_backend_raising(exc)
+
+    with pytest.raises(EmbeddingError) as excinfo:
+        backend.embed(["alpha"], task_type=None)
+
+    assert excinfo.value.retryable is True
+    assert excinfo.value.retry_after == 11.0
+
+
+def test_google_429_with_huge_retry_after_fails_over_without_sleeping(
+    embedding_provider: Callable[..., dict[str, Any]],
+    embeddings_config: Callable[..., EmbeddingsConfig],
+    cache: SqliteCache,
+) -> None:
+    google_backend, google_client = _google_backend_raising(
+        _GoogleAPIError("rate limited", code=429, headers={"Retry-After": "3600"})
+    )
+    providers = {
+        "google": embedding_provider(base_url="https://g.test/v1"),
+        "jina": embedding_provider(
+            base_url="https://j.test/v1", model="jina-embeddings-v5-text-nano"
+        ),
+    }
+    config = embeddings_config(providers, order=["google", "jina"], fallback=True)
+    healthy = RecordingBackend()
+    backends: dict[str, EmbeddingBackend] = {"google": google_backend, "jina": healthy}
+
+    def factory(name: str, cfg: Any, key: str) -> EmbeddingBackend:
+        return backends[name]
+
+    sleeps: list[float] = []
+    client = EmbeddingClient(
+        config,
+        cache,
+        api_key_resolver=lambda name: "secret",
+        backend_factory=factory,
+        sleep=sleeps.append,
+        max_retries=2,
+    )
+
+    result = client.embed_texts(["alpha"])
+
+    assert result.provider_used == "jina"
+    assert google_client.models.calls == 1  # no retry after the huge cooldown
+    assert sleeps == []
 
 
 def test_google_permanent_error_fails_over_without_retry(

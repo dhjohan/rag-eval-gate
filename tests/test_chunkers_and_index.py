@@ -295,7 +295,7 @@ def test_c2_oversized_table_splits_on_rows_with_header_only_in_index_text() -> N
         strategy="structure_aware",
         max_tokens=50,
         overlap_tokens=5,
-        hard_max_table_tokens=12,
+        hard_max_table_tokens=18,
     )
 
     chunks = chunk_structure_aware(document, config, OfflineTokenizer())
@@ -700,7 +700,7 @@ def test_build_index_rolls_back_when_publish_swap_fails(
         return real_replace(self, target)
 
     monkeypatch.setattr(Path, "replace", failing_replace)
-    with pytest.raises(OSError, match="simulated rename failure"):
+    with pytest.raises(IndexBuildError, match="could not publish index"):
         _build(tmp_path, embedder=embedder, force=True)
 
     # The previous good index survived untouched and no temp/backup litter.
@@ -754,7 +754,7 @@ def test_c3_index_text_stays_within_budget() -> None:
 
 
 def test_c2_single_oversized_table_row_is_split() -> None:
-    # 22 whitespace tokens by itself, over the 12-token hard cap.
+    # 22 whitespace tokens by itself, over the 20-token hard cap.
     row = "| " + " ".join(["x"] * 20) + " |"
     text = "# Data\n| Header |\n| --- |\n" + row
     document = _build_document([text])
@@ -762,7 +762,7 @@ def test_c2_single_oversized_table_row_is_split() -> None:
         strategy="structure_aware",
         max_tokens=50,
         overlap_tokens=5,
-        hard_max_table_tokens=12,
+        hard_max_table_tokens=20,
     )
 
     chunks = chunk_structure_aware(document, config, OfflineTokenizer())
@@ -772,10 +772,88 @@ def test_c2_single_oversized_table_row_is_split() -> None:
     tokenizer = OfflineTokenizer()
     for chunk in table_chunks:
         _assert_invariant(document, chunk)
-        assert tokenizer.count(chunk.index_text) <= 12
+        assert tokenizer.count(chunk.index_text) <= 20
     # The row content is fully covered across the split parts.
     joined = "".join(chunk.raw_text for chunk in chunks)
     assert joined.count("x") == 20
+
+
+def test_c2_first_row_of_a_part_is_checked_against_header_plus_row() -> None:
+    # Header is 10 tokens, row is 12: the row fits alone (cap 20) but
+    # header + row (23) does not, so the row must be split, not emitted raw.
+    row = "| " + " ".join(["y"] * 10) + " |"
+    text = "# Data\n| Header |\n| --- |\n" + row
+    document = _build_document([text])
+    config = ChunkConfig(
+        strategy="structure_aware",
+        max_tokens=50,
+        overlap_tokens=5,
+        hard_max_table_tokens=20,
+    )
+
+    chunks = chunk_structure_aware(document, config, OfflineTokenizer())
+
+    table_chunks = [chunk for chunk in chunks if chunk.section_path == "Data"]
+    assert len(table_chunks) >= 2
+    tokenizer = OfflineTokenizer()
+    for chunk in table_chunks:
+        _assert_invariant(document, chunk)
+        assert tokenizer.count(chunk.index_text) <= 20
+
+
+def test_c3_table_index_text_stays_within_hard_cap() -> None:
+    # A table bigger than max_tokens but under hard_max must keep its
+    # prefix + header + rows within hard_max_table_tokens in index_text.
+    rows = "\n".join(f"| row{i} | {'x' * 3} |" for i in range(12))
+    text = f"# Data\n| Header | Value |\n| --- | --- |\n{rows}"
+    document = _build_document([text], title="My Guidance Document")
+    config = ChunkConfig(
+        strategy="contextual_heading",
+        max_tokens=40,
+        overlap_tokens=5,
+        hard_max_table_tokens=60,
+    )
+
+    chunks = chunk_contextual_heading(document, config, OfflineTokenizer())
+
+    table_chunks = [chunk for chunk in chunks if chunk.section_path == "Data"]
+    assert len(table_chunks) >= 2
+    tokenizer = OfflineTokenizer()
+    for chunk in table_chunks:
+        _assert_invariant(document, chunk)
+        assert tokenizer.count(chunk.index_text) <= 60
+
+
+def test_list_indexes_skips_dot_directories(tmp_path: Path) -> None:
+    from rag_eval.pipeline.index import list_indexes
+
+    good = tmp_path / "aaa"
+    good.mkdir()
+    manifest = {
+        "schema_version": 1,
+        "index_id": "aaa",
+        "chunk_config": {
+            "strategy": "structure_aware",
+            "max_tokens": 450,
+            "overlap_tokens": 64,
+            "hard_max_table_tokens": 900,
+        },
+        "embedding_provider": "jina",
+        "embedding_model": "jina-test",
+        "dims": 64,
+        "corpus_sha256": "0" * 64,
+        "chunk_count": 1,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    (good / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    for dot_name in (".aaa.bak", ".aaa.tmp123"):
+        dot = tmp_path / dot_name
+        dot.mkdir()
+        (dot / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    listed = list_indexes(tmp_path)
+
+    assert [m.index_id for m in listed] == ["aaa"]
 
 
 # -- CLI ---------------------------------------------------------------------

@@ -15,7 +15,7 @@ STRATEGY_VALUES: tuple[str, ...] = (
 
 # Bump when chunker/tokenizer/index-writing behavior changes so a changed
 # implementation can never reuse an index built by the old one.
-PIPELINE_VERSION = "2"
+PIPELINE_VERSION = "3"
 
 
 class ChunkConfig(BaseModel):

@@ -26,12 +26,24 @@ def _module() -> Any:
     return importlib.import_module("rag_eval.tools.annotator_app")
 
 
-def _document() -> CanonicalDocument:
+@pytest.fixture(autouse=True)
+def _clear_streamlit_cache() -> Any:
+    """streamlit's cache storage is process-global; isolate every test."""
+    import importlib.util
+
+    if importlib.util.find_spec("streamlit") is not None:
+        import streamlit as st
+
+        st.cache_resource.clear()
+    yield
+
+
+def _document(doc_id: str = "synthetic-doc") -> CanonicalDocument:
     page = CanonicalPage(
         page_num=1, start_char=0, end_char=len(PAGE_TEXT), text=PAGE_TEXT, table_count=0
     )
     return CanonicalDocument(
-        doc_id="synthetic-doc",
+        doc_id=doc_id,
         title="Synthetic document",
         sha256=SHA,
         page_count=1,
@@ -42,10 +54,10 @@ def _document() -> CanonicalDocument:
     )
 
 
-def _write_doc(docs_dir: Path) -> None:
+def _write_doc(docs_dir: Path, doc_id: str = "synthetic-doc") -> None:
     docs_dir.mkdir(parents=True, exist_ok=True)
-    (docs_dir / "synthetic-doc.json").write_text(
-        json.dumps(_document().model_dump(mode="json")), encoding="utf-8"
+    (docs_dir / f"{doc_id}.json").write_text(
+        json.dumps(_document(doc_id).model_dump(mode="json")), encoding="utf-8"
     )
 
 
@@ -182,7 +194,11 @@ def test_build_payload_drops_citations_for_unanswerable_items() -> None:
 
 
 def _run_app(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dataset_source: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dataset_source: str,
+    *,
+    doc_id: str = "synthetic-doc",
 ) -> tuple[Any, Path]:
     """Run the real app script from ``tmp_path`` (its default paths are relative)."""
     pytest.importorskip("streamlit")
@@ -190,7 +206,7 @@ def _run_app(
 
     module = _module()
     monkeypatch.chdir(tmp_path)
-    _write_doc(tmp_path / "data" / "processed" / "docs")
+    _write_doc(tmp_path / "data" / "processed" / "docs", doc_id)
     dataset = tmp_path / "data" / "eval" / "golden_qa.jsonl"
     dataset.parent.mkdir(parents=True, exist_ok=True)
     dataset.write_text(dataset_source, encoding="utf-8")
@@ -274,3 +290,27 @@ def test_apptest_new_draft_reusing_an_existing_qa_id_is_rejected(
         for error in at.error
     )
     assert dataset.read_text(encoding="utf-8") == source
+
+
+def test_apptest_document_cache_is_not_shared_between_app_instances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two AppTest runs with different corpora must each see their own docs."""
+    pytest.importorskip("streamlit")
+
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first, _ = _run_app(
+        monkeypatch, first_root, json.dumps(_valid_item()) + "\n", doc_id="doc-a"
+    )
+    second, _ = _run_app(
+        monkeypatch, second_root, json.dumps(_valid_item()) + "\n", doc_id="doc-b"
+    )
+
+    def doc_options(at: Any) -> list[str]:
+        return next(sb for sb in at.selectbox if sb.label == "Document").options
+
+    assert doc_options(first) == ["doc-a"]
+    assert doc_options(second) == ["doc-b"]

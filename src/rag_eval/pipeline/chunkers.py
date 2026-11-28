@@ -176,12 +176,17 @@ def _table_parts(
     document: CanonicalDocument,
     config: ChunkConfig,
     tokenizer: Tokenizer,
+    *,
+    cap: int | None = None,
 ) -> list[tuple[int, int, str]]:
     """Split an oversized table on row boundaries.
 
     Part 0 keeps the header in ``raw_text``. Continuation parts repeat the
     header only in ``index_text`` (returned as the third tuple field).
+    ``cap`` defaults to ``config.hard_max_table_tokens`` and bounds the
+    header-plus-rows text that ends up in ``index_text``.
     """
+    cap = cap if cap is not None else config.hard_max_table_tokens
     relative = list(_iter_lines(block.text))
     if len(relative) < 2:
         return [(block.start, block.end, "")]
@@ -225,13 +230,14 @@ def _table_parts(
             trial_text = header_text + "\n" + "\n".join(
                 [row[2] for row in current] + [row_text]
             )
-            if tokenizer.count(trial_text) > config.hard_max_table_tokens:
+            if tokenizer.count(trial_text) > cap:
                 flush()
-        if not current and tokenizer.count(row_text) > config.hard_max_table_tokens:
-            # A single row that is oversized even on its own: split it at
-            # token boundaries as a last resort. The first piece also
-            # carries the header lines in ``raw_text`` when possible.
-            budget = max(1, config.hard_max_table_tokens - header_tokens - 1)
+        if not current and tokenizer.count(header_text + "\n" + row_text) > cap:
+            # The first row of a part is trial-checked against header + row,
+            # and a row that cannot fit even then is split at token boundaries
+            # as a last resort. The first piece also carries the header lines
+            # in ``raw_text`` when possible.
+            budget = max(1, cap - header_tokens - 1)
             windows = list(
                 _token_windows(tokenizer.token_char_spans(row_text), budget, 0)
             )
@@ -256,15 +262,19 @@ def _structure_spans(
     tokenizer: Tokenizer,
     *,
     token_budget: int | None = None,
+    table_cap: int | None = None,
     blocks: list[_Block] | None = None,
 ) -> list[_Span]:
-    """Pack structural blocks into spans of at most ``token_budget`` tokens.
+    """Pack structural blocks into spans within their respective caps.
 
-    Token counts are always taken from the exact candidate slice of
-    ``full_text`` so intervening newlines are budgeted too; summing per-block
-    counts let packed chunks exceed the cap by the separator characters.
+    Prose is packed to ``token_budget`` (default ``max_tokens``); tables are
+    split at ``table_cap`` (default ``hard_max_table_tokens``). Token counts
+    are always taken from the exact candidate slice of ``full_text`` so
+    intervening newlines are budgeted too; summing per-block counts let
+    packed chunks exceed the cap by the separator characters.
     """
     budget = token_budget if token_budget is not None else config.max_tokens
+    table_cap = table_cap if table_cap is not None else config.hard_max_table_tokens
     spans: list[_Span] = []
     accumulator: list[_Block] = []
 
@@ -283,10 +293,12 @@ def _structure_spans(
             accumulator = [block]
         elif block.kind == "table":
             flush()
-            if tokenizer.count(block.text) <= config.hard_max_table_tokens:
+            if tokenizer.count(block.text) <= table_cap:
                 spans.append(_Span(block.start, block.end, block.section_path))
             else:
-                for start, end, header in _table_parts(block, document, config, tokenizer):
+                for start, end, header in _table_parts(
+                    block, document, config, tokenizer, cap=table_cap
+                ):
                     spans.append(_Span(start, end, block.section_path, header))
         else:
             paragraph_tokens = tokenizer.count(block.text)
@@ -389,7 +401,8 @@ def chunk_contextual_heading(
     """C3: C2 spans plus a ``[Document | Section]`` context prefix.
 
     The prefix is part of ``index_text``, so its tokens are subtracted from
-    the packing budget: the indexed text stays within ``max_tokens``.
+    both budgets: prose ``index_text`` stays within ``max_tokens`` and table
+    ``index_text`` stays within ``hard_max_table_tokens``.
     """
     blocks = _structure_blocks(document)
     prefix_tokens = max(
@@ -397,12 +410,20 @@ def chunk_contextual_heading(
         default=0,
     )
     budget = max(1, config.max_tokens - prefix_tokens - 1)
+    table_cap = max(1, config.hard_max_table_tokens - prefix_tokens - 1)
     return _emit(
         document,
         config,
         tokenizer,
         "contextual_heading",
-        _structure_spans(document, config, tokenizer, token_budget=budget, blocks=blocks),
+        _structure_spans(
+            document,
+            config,
+            tokenizer,
+            token_budget=budget,
+            table_cap=table_cap,
+            blocks=blocks,
+        ),
         contextual=True,
     )
 
