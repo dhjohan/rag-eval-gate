@@ -285,10 +285,14 @@ class HybridRetriever:
 
     def _make_reranker(self) -> RerankClient:
         settings = self._settings or Settings()
-        providers = load_providers_config(
-            self._providers_config_path, env=build_env(settings)
+        env = build_env(settings)
+        providers = load_providers_config(self._providers_config_path, env=env)
+        self._reranker = Reranker(
+            providers.rerank,
+            api_key_resolver=lambda env_name: resolve_api_key(
+                env_name, settings, environ=env
+            ),
         )
-        self._reranker = Reranker(providers.rerank)
         self._owns_reranker = True
         return self._reranker
 

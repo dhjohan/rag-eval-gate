@@ -18,7 +18,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,7 +29,9 @@ from rag_eval.cache.sqlite_cache import SqliteCache
 from rag_eval.config import (
     EmbeddingsConfig,
     Settings,
+    build_env,
     load_providers_config,
+    resolve_api_key,
 )
 from rag_eval.ingest.models import CanonicalDocument
 from rag_eval.pipeline.chunkers import chunk_documents
@@ -94,8 +96,8 @@ def compute_index_id(
 def corpus_digest(documents: Iterable[CanonicalDocument]) -> str:
     """Hash the corpus identity, including metadata baked into chunk text.
 
-    ``title`` and ``effective_date`` feed the C3 contextual prefix, so they must
-    invalidate a built index just like a text change does.
+    ``title`` and ``effective_date`` feed the C3 contextual prefix, while page
+    geometry controls chunk page spans, so all must invalidate a built index.
     """
     entries = sorted(
         [
@@ -103,6 +105,13 @@ def corpus_digest(documents: Iterable[CanonicalDocument]) -> str:
             hashlib.sha256(document.full_text.encode("utf-8")).hexdigest(),
             document.title,
             document.effective_date or "",
+            json.dumps(
+                [
+                    [page.page_num, page.start_char, page.end_char]
+                    for page in document.pages
+                ],
+                separators=(",", ":"),
+            ),
         ]
         for document in documents
     )
@@ -146,9 +155,12 @@ def _resolve_embedding(
 
 
 def _derive_embeddings_config(
-    provider: str, providers_config_path: str | Path
+    provider: str,
+    providers_config_path: str | Path,
+    *,
+    env: Mapping[str, str] | None = None,
 ) -> EmbeddingsConfig:
-    providers = load_providers_config(providers_config_path)
+    providers = load_providers_config(providers_config_path, env=env)
     if provider not in providers.embeddings.providers:
         raise IndexBuildError(f"unknown embedding provider '{provider}'")
     config = providers.embeddings.providers[provider]
@@ -166,9 +178,18 @@ def default_embedder(
 ) -> np.ndarray:
     """Embed ``texts`` through the real ``EmbeddingClient`` (network)."""
     settings = Settings()
-    embeddings_config = _derive_embeddings_config(provider, providers_config_path)
+    env = build_env(settings)
+    embeddings_config = _derive_embeddings_config(
+        provider, providers_config_path, env=env
+    )
     with SqliteCache(settings.rag_eval_cache_path) as cache:
-        client = EmbeddingClient(embeddings_config, cache)
+        client = EmbeddingClient(
+            embeddings_config,
+            cache,
+            api_key_resolver=lambda env_name: resolve_api_key(
+                env_name, settings, environ=env
+            ),
+        )
         # ``task_type=None`` lets the provider config supply the correct format
         # (Jina maps RETRIEVAL_DOCUMENT internally); do not hardcode one.
         result = client.embed_texts(list(texts), task_type=None)

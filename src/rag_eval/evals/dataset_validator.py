@@ -177,7 +177,10 @@ def _locate(slice_text: str, quote: str) -> list[tuple[int, int]]:
     if not tokens:
         return []
     pattern = r"\s+".join(re.escape(token) for token in tokens)
-    return [(match.start(), match.end()) for match in re.finditer(pattern, slice_text)]
+    return [
+        (match.start(1), match.end(1))
+        for match in re.finditer(f"(?=({pattern}))", slice_text)
+    ]
 
 
 def _doc_text_sha256(document: CanonicalDocument) -> str:
@@ -359,7 +362,7 @@ def validate_dataset(
         items=items,
         resolved=resolved,
         problems=problems,
-        smoke_ids=build_smoke_split(items, smoke_size=smoke_size, seed=seed),
+        smoke_ids=build_smoke_split(resolved, smoke_size=smoke_size, seed=seed),
     )
 
 

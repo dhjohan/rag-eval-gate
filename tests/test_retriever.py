@@ -16,12 +16,13 @@ import yaml
 from typer.testing import CliRunner
 
 from rag_eval.cli import app
+from rag_eval.config import Settings
 from rag_eval.ingest.models import CanonicalDocument, CanonicalPage
 from rag_eval.pipeline.index import build_index
 from rag_eval.pipeline.models import ChunkConfig
 from rag_eval.pipeline.retriever import HybridRetriever, RetrievalError
 from rag_eval.pipeline.tokenizer import OfflineTokenizer
-from rag_eval.providers.rerank import RerankHit
+from rag_eval.providers.rerank import Reranker, RerankHit
 
 SHA = "0" * 64
 DIMS = 64
@@ -219,6 +220,24 @@ def test_rerank_reorders_hybrid_candidates(tmp_path: Path) -> None:
     assert reranker.calls[0][2] == 1
     assert hits
     assert "wireless" in hits[0].raw_text.lower()
+
+
+def test_reranker_uses_settings_only_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_dir, config = _build(tmp_path)
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+
+    with HybridRetriever(
+        index_dir,
+        mode="rerank",
+        providers_config_path=config,
+        settings=Settings(jina_api_key="settings-only"),
+    ) as retriever:
+        reranker = retriever._make_reranker()
+
+        assert isinstance(reranker, Reranker)
+        assert reranker.is_configured
 
 
 def test_query_embedding_dims_must_match_manifest(tmp_path: Path) -> None:

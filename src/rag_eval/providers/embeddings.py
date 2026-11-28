@@ -239,10 +239,27 @@ class JinaEmbeddingBackend:
         items = body.get("data")
         if not isinstance(items, list) or len(items) != len(texts):
             raise EmbeddingError("jina embedding returned an unexpected payload")
+        for position, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise EmbeddingError(
+                    f"jina embedding data item {position} was not an object"
+                )
+            index = item.get("index")
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise EmbeddingError(
+                    f"jina embedding data item {position} had invalid index "
+                    f"{index!r}; expected an integer"
+                )
+        ordered = sorted(items, key=lambda item: item["index"])
+        indices = [item["index"] for item in ordered]
+        if indices != list(range(len(texts))):
+            raise EmbeddingError(
+                f"jina embedding returned indices {indices}; "
+                f"expected exactly 0..{len(texts) - 1}"
+            )
         try:
-            ordered = sorted(items, key=lambda item: item.get("index", 0))
             vectors = [list(item["embedding"]) for item in ordered]
-        except (AttributeError, KeyError, TypeError) as exc:
+        except (KeyError, TypeError) as exc:
             raise EmbeddingError(
                 f"jina embedding returned an unexpected payload: {exc}"
             ) from exc
